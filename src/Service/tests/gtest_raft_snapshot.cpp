@@ -916,3 +916,107 @@ TEST(RaftSnapshot, createSnapshotWithFuzzyLog)
     createSnapshotWithFuzzyLog(true);
     createSnapshotWithFuzzyLog(false);
 }
+
+TEST(RaftSnapshot, CorruptLatestSnapshotFallsBackToOlder)
+{
+    String snap_dir(SNAP_DIR + "/corrupt_fallback");
+    String log_dir(LOG_DIR + "/corrupt_fallback");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    RaftSettingsPtr raft_settings = RaftSettings::getDefault();
+    const UInt32 object_node_size = 100000;
+
+    // Step 1: Create snapshot A (older, 500 user nodes + root = 501 nodes)
+    {
+        KeeperSnapshotManager snap_mgr(snap_dir, 3, object_node_size);
+        ptr<cluster_config> config = cs_new<cluster_config>(1, 0);
+        KeeperStore store(raft_settings->dead_session_check_period_ms);
+
+        for (int i = 1; i <= 500; i++)
+            setNode(store, std::to_string(i), "data_A");
+
+        store.getSessionID(3000); // session 1
+
+        snapshot meta_a(500, 1, config); // last_log_idx=500, term=1
+        snap_mgr.createSnapshot(meta_a, store, store.getZxid(), store.getSessionIDCounter());
+    }
+
+    sleep(2); // Ensure different create_time in file names
+
+    // Step 2: Create snapshot B (newer, 1000 user nodes + root = 1001 nodes)
+    {
+        KeeperSnapshotManager snap_mgr(snap_dir, 3, object_node_size);
+        snap_mgr.loadSnapshotMetas();
+
+        ptr<cluster_config> config = cs_new<cluster_config>(1, 0);
+        KeeperStore store(raft_settings->dead_session_check_period_ms);
+
+        for (int i = 1; i <= 1000; i++)
+            setNode(store, std::to_string(i), "data_B");
+
+        store.getSessionID(3000); // session 1
+
+        snapshot meta_b(1000, 2, config); // last_log_idx=1000, term=2
+        snap_mgr.createSnapshot(meta_b, store, store.getZxid(), store.getSessionIDCounter());
+    }
+
+    // Step 3: Corrupt snapshot B's object 1 (IntMap). Reload metadata and truncate the file.
+    {
+        KeeperSnapshotManager snap_mgr(snap_dir, 3, object_node_size);
+        snap_mgr.loadSnapshotMetas();
+
+        auto last_meta = snap_mgr.lastSnapshot();
+        ASSERT_NE(last_meta, nullptr);
+        ASSERT_EQ(last_meta->get_last_log_idx(), 1000);
+
+        auto key = getSnapshotStoreMapKey(*last_meta);
+        auto & snap_store = snap_mgr.getSnapshots().find(key)->second;
+        auto object_paths = snap_store->getObjectPaths();
+
+        ASSERT_TRUE(object_paths.find(1) != object_paths.end());
+        std::filesystem::resize_file(object_paths[1], 0); // truncate IntMap to 0 bytes
+    }
+
+    // Step 4: Construct NuRaftStateMachine — simulates restart.
+    // The constructor should try snapshot B first (fail due to corrupt IntMap),
+    // then fall back to snapshot A.
+    {
+        KeeperResponsesQueue queue;
+        std::mutex new_session_id_callback_mutex;
+        std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+        NuRaftStateMachine machine(
+            queue,
+            raft_settings,
+            snap_dir,
+            log_dir,
+            10, /* snapshot_create_interval */
+            3, /* keep_max_snapshot_count */
+            new_session_id_callback_mutex,
+            new_session_id_callback,
+            nullptr, /* log_store */
+            "", /* super_digest */
+            MAX_OBJECT_NODE_SIZE,
+            nullptr /* request_processor */);
+
+        // Should have loaded snapshot A's data: 500 user nodes + "/" root + 3 system nodes
+        EXPECT_GE(machine.getNodesCount(), 501);
+
+        // snapshot B data should NOT be present (node "600" exists only in B)
+        EXPECT_FALSE(machine.exists("/600"));
+
+        // snapshot A data should be present
+        EXPECT_TRUE(machine.exists("/1"));
+        EXPECT_EQ(machine.getNode("/1").data, "data_A");
+        EXPECT_TRUE(machine.exists("/500"));
+
+        // last_committed_idx should match snapshot A
+        EXPECT_EQ(machine.last_commit_index(), 500);
+
+        machine.shutdown();
+    }
+
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}

@@ -46,6 +46,7 @@ NuRaftStateMachine::NuRaftStateMachine(
     , store(raft_settings->dead_session_check_period_ms, super_digest)
     , responses_queue(responses_queue_)
     , request_processor(request_processor_)
+    , raft_log_store(log_store_)
     , last_committed_idx(0)
     , snapshot_creating_interval(static_cast<uint64_t>(internal) * 1000000)
     , last_snapshot_time(getCurrentTimeMicroseconds())
@@ -61,14 +62,81 @@ NuRaftStateMachine::NuRaftStateMachine(
     /// Load snapshot meta from disk
     auto snapshots_count = snap_mgr->loadSnapshotMetas();
 
-    LOG_INFO(log, "Found {} snapshots from disk, load the latest one", snapshots_count);
-    if (auto last_snapshot = snap_mgr->lastSnapshot())
-        applySnapshotImpl(*last_snapshot);
-
+    /// Create committed log index manager early so we can validate snapshots against
+    /// the log store before accepting one. This avoids falling back to a snapshot
+    /// whose log range has already been compacted away.
     committed_log_manager = cs_new<LastCommittedIndexManager>(log_dir);
+    uint64_t previous_last_commit_id = committed_log_manager->get();
+
+    if (snapshots_count > 0)
+    {
+        LOG_INFO(log, "Found {} snapshots from disk, trying from newest to oldest", snapshots_count);
+
+        bool loaded = false;
+        const auto & snapshots = snap_mgr->getSnapshots();
+        for (auto it = snapshots.rbegin(); it != snapshots.rend(); ++it)
+        {
+            auto current_meta = it->second->getSnapshotMeta();
+            try
+            {
+                LOG_INFO(
+                    log,
+                    "Trying to load snapshot with last_log_term {}, last_log_idx {}",
+                    current_meta->get_last_log_term(),
+                    current_meta->get_last_log_idx());
+                if (applySnapshotImpl(*current_meta))
+                {
+                    /// Verify the log store can bridge from this snapshot to the last committed index.
+                    /// If logs between snapshot and last committed have been compacted, this snapshot
+                    /// is too old to be useful — try an even older one (or none at all).
+                    if (previous_last_commit_id > last_committed_idx && log_store_)
+                    {
+                        ulong log_start = log_store_->start_index();
+                        if (last_committed_idx + 1 < log_start)
+                        {
+                            LOG_WARNING(
+                                log,
+                                "Snapshot at last_log_idx {} requires log replay from {} but log store starts at {}. "
+                                "Gap detected, trying older snapshot.",
+                                last_committed_idx.load(),
+                                last_committed_idx + 1,
+                                log_start);
+                            store.reset();
+                            last_committed_idx = 0;
+                            continue;
+                        }
+                    }
+
+                    loaded = true;
+                    LOG_INFO(
+                        log,
+                        "Successfully loaded snapshot with last_log_idx {}",
+                        current_meta->get_last_log_idx());
+                    break;
+                }
+            }
+            catch (const Exception & e)
+            {
+                LOG_WARNING(
+                    log,
+                    "Failed to load snapshot at last_log_idx {}: {}. Trying older snapshot.",
+                    current_meta->get_last_log_idx(),
+                    e.displayText());
+                store.reset();
+                last_committed_idx = 0;
+            }
+        }
+
+        if (!loaded)
+            LOG_WARNING(log, "All {} snapshots failed to load, proceeding with empty state", snapshots_count);
+    }
+    else
+    {
+        LOG_INFO(log, "No snapshots found on disk");
+    }
 
     /// Last committed idx of the previous startup, we should apply log to here.
-    if (uint64_t previous_last_commit_id = committed_log_manager->get(); previous_last_commit_id == 0)
+    if (previous_last_commit_id == 0)
     {
         LOG_INFO(log, "No previous last commit idx found, skip replaying logs.");
     }
@@ -241,6 +309,7 @@ void NuRaftStateMachine::create_snapshot(snapshot & s, int64_t next_zxid, int64_
     std::lock_guard lock(snapshot_mutex);
     snap_mgr->createSnapshot(s, store, next_zxid, next_session_id);
     snap_mgr->removeSnapshots();
+    compactLogStore();
 }
 
 void NuRaftStateMachine::create_snapshot_async(SnapTask & s)
@@ -248,6 +317,7 @@ void NuRaftStateMachine::create_snapshot_async(SnapTask & s)
     std::lock_guard lock(snapshot_mutex);
     snap_mgr->createSnapshotAsync(s);
     snap_mgr->removeSnapshots();
+    compactLogStore();
 }
 
 void NuRaftStateMachine::save_snapshot_data(snapshot &, const ulong, buffer &)
@@ -528,6 +598,55 @@ void NuRaftStateMachine::reset()
         std::lock_guard lock(new_session_id_callback_mutex);
         new_session_id_callback.clear();
     }
+}
+
+void NuRaftStateMachine::compactLogStore()
+{
+    if (!raft_log_store)
+        return;
+
+    const auto & snapshots = snap_mgr->getSnapshots();
+    if (snapshots.empty())
+    {
+        LOG_DEBUG(log, "No snapshots to retain, skipping log compaction");
+        return;
+    }
+
+    /// The oldest retained snapshot defines the safe compaction boundary:
+    /// we can delete all logs up to (but not including) its first index
+    /// because every kept snapshot must have a complete log trail behind it.
+    auto oldest_snapshot = snapshots.begin()->second->getSnapshotMeta();
+    UInt64 oldest_idx = oldest_snapshot->get_last_log_idx();
+
+    /// Don't compact if the boundary is at or before index 1 (nothing to remove).
+    if (oldest_idx <= 1)
+    {
+        LOG_DEBUG(log, "Oldest snapshot last_log_idx is {}, nothing to compact", oldest_idx);
+        return;
+    }
+
+    /// compact(last_log_index) removes log entries up to and including last_log_index.
+    /// We compact up to oldest_idx - 1 so that logs from oldest_idx onward are preserved,
+    /// ensuring the oldest snapshot can still be replayed.
+    UInt64 compact_upto = oldest_idx - 1;
+
+    UInt64 log_start = raft_log_store->start_index();
+    if (compact_upto < log_start)
+    {
+        LOG_DEBUG(
+            log,
+            "Logs already compacted past {} (log store starts at {}), nothing to compact",
+            compact_upto,
+            log_start);
+        return;
+    }
+
+    LOG_INFO(
+        log,
+        "Compacting log store up to {} (oldest retained snapshot at {})",
+        compact_upto,
+        oldest_idx);
+    raft_log_store->compact(compact_upto);
 }
 
 

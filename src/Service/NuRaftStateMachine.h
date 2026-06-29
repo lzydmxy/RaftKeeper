@@ -281,6 +281,10 @@ private:
     void snapThread();
 
 
+    /// Compact log store up to the oldest retained snapshot's last index.
+    /// This guarantees that any snapshot on disk can be replayed from existing logs.
+    void compactLogStore();
+
     /// raft related settings
     RaftSettingsPtr raft_settings;
 
@@ -291,6 +295,9 @@ private:
     KeeperResponsesQueue & responses_queue;
 
     std::shared_ptr<RequestProcessor> request_processor;
+
+    /// Reference to the Raft log store, used for safe log compaction after snapshot creation.
+    ptr<nuraft::log_store> raft_log_store;
 
     /// Last committed Raft log number.
     std::atomic<uint64_t> last_committed_idx;
