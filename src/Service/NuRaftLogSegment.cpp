@@ -200,7 +200,18 @@ void NuRaftLogSegment::load()
 
         if (entry_off + log_entry_len > file_size_read)
         {
-            /// The last log entry is incomplete — the server crashed during a write.
+            /// A closed segment with a truncated tail means real disk corruption,
+            /// not a crash mid-write (writes only target the open segment).
+            if (!is_open)
+                throw Exception(
+                    ErrorCodes::CORRUPTED_LOG,
+                    "Closed log segment {} is corrupted: incomplete entry at offset {}, file size {}, would need {} bytes.",
+                    file_name,
+                    entry_off,
+                    file_size_read,
+                    entry_off + log_entry_len);
+
+            /// The last log entry in the open segment is incomplete — the server crashed during a write.
             /// Truncate the partial entry; it was never committed, so skipping it
             /// is safe (same behavior as ZooKeeper's FileTxnIterator).
             LOG_WARNING(

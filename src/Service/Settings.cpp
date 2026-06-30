@@ -74,6 +74,7 @@ void RaftSettings::loadFromConfig(const String & config_elem, const Poco::Util::
         heart_beat_interval_ms = config.getUInt(get_key("heart_beat_interval_ms"), 500);
         client_req_timeout_ms = config.getUInt(get_key("client_req_timeout_ms"), operation_timeout_ms);
         election_timeout_lower_bound_ms = config.getUInt(get_key("election_timeout_lower_bound_ms"), Coordination::ELECTION_TIMEOUT_LOWER_BOUND_MS);
+        election_timeout_upper_bound_ms = config.getUInt(get_key("election_timeout_upper_bound_ms"), Coordination::ELECTION_TIMEOUT_UPPER_BOUND_MS);
         snapshot_distance = config.getUInt(get_key("snapshot_distance"), 3000000);
         max_stored_snapshots = config.getUInt(get_key("max_stored_snapshots"), 3);
         /// Log compaction is handled by compactLogStore() in NuRaftStateMachine,

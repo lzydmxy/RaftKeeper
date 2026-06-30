@@ -88,7 +88,8 @@ NuRaftStateMachine::NuRaftStateMachine(
                 {
                     /// Verify the log store can bridge from this snapshot to the last committed index.
                     /// If logs between snapshot and last committed have been compacted, this snapshot
-                    /// is too old to be useful — try an even older one (or none at all).
+                    /// is too old to be useful. Older snapshots have smaller last_log_idx, so the gap
+                    /// can only widen — abort the fallback loop instead of trying older snapshots.
                     if (previous_last_commit_id > last_committed_idx && log_store_)
                     {
                         ulong log_start = log_store_->start_index();
@@ -97,13 +98,13 @@ NuRaftStateMachine::NuRaftStateMachine(
                             LOG_WARNING(
                                 log,
                                 "Snapshot at last_log_idx {} requires log replay from {} but log store starts at {}. "
-                                "Gap detected, trying older snapshot.",
+                                "Older snapshots would only widen the gap, aborting fallback.",
                                 last_committed_idx.load(),
                                 last_committed_idx + 1,
                                 log_start);
                             store.reset();
                             last_committed_idx = 0;
-                            continue;
+                            break;
                         }
                     }
 
