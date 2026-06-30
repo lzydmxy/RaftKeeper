@@ -194,12 +194,62 @@ void NuRaftLogSegment::load()
     UInt64 last_index_read = first_index - 1;
     for (; entry_off < file_size_read;)
     {
+        /// If fewer bytes remain than a full header, treat as partial-entry trailing garbage:
+        /// loadEntryHeader would otherwise short-read and surface a misleading "fail to read header" error.
+        const UInt64 bytes_remaining = file_size_read - entry_off;
+        if (bytes_remaining < LogEntryHeader::HEADER_SIZE)
+        {
+            if (!is_open)
+                throw Exception(
+                    ErrorCodes::CORRUPTED_LOG,
+                    "Closed log segment {} is corrupted: trailing {} bytes (less than header) at offset {}.",
+                    file_name,
+                    bytes_remaining,
+                    entry_off);
+
+            LOG_WARNING(
+                log,
+                "{} has trailing {} bytes (less than header size {}) at offset {}, truncating.",
+                file_name,
+                bytes_remaining,
+                LogEntryHeader::HEADER_SIZE,
+                entry_off);
+            if (ftruncate(seg_fd, entry_off) != 0)
+                throwFromErrno(ErrorCodes::CORRUPTED_LOG, "Failed to truncate trailing partial header in {}", file_name);
+            break;
+        }
+
         LogEntryHeader header = loadEntryHeader(entry_off);
 
         const UInt64 log_entry_len = sizeof(LogEntryHeader) + header.data_length;
 
         if (entry_off + log_entry_len > file_size_read)
-            throw Exception(ErrorCodes::CORRUPTED_LOG, "Corrupted log segment file {}.", file_name);
+        {
+            /// A closed segment with a truncated tail means real disk corruption,
+            /// not a crash mid-write (writes only target the open segment).
+            if (!is_open)
+                throw Exception(
+                    ErrorCodes::CORRUPTED_LOG,
+                    "Closed log segment {} is corrupted: incomplete entry at offset {}, file size {}, would need {} bytes.",
+                    file_name,
+                    entry_off,
+                    file_size_read,
+                    entry_off + log_entry_len);
+
+            /// The last log entry in the open segment is incomplete — the server crashed during a write.
+            /// Truncate the partial entry; it was never committed, so skipping it
+            /// is safe (same behavior as ZooKeeper's FileTxnIterator).
+            LOG_WARNING(
+                log,
+                "{} has an incomplete tail entry at offset {}, truncating (file size {}, would need {} bytes).",
+                file_name,
+                entry_off,
+                file_size_read,
+                entry_off + log_entry_len);
+            if (ftruncate(seg_fd, entry_off) != 0)
+                throwFromErrno(ErrorCodes::CORRUPTED_LOG, "Failed to truncate incomplete tail entry in {}", file_name);
+            break;
+        }
 
         offsets.push_back(entry_off);
         ++last_index_read;
@@ -236,17 +286,9 @@ void NuRaftLogSegment::load()
         last_index = last_index_read;
     }
 
-    if (entry_off != file_size_read)
-    {
-        throw Exception(
-            ErrorCodes::CORRUPTED_LOG,
-            "{} is corrupted, entry_off {} != file_size {}, maybe the last log entry is incomplete.",
-            file_name,
-            entry_off,
-            file_size_read);
-        /// ftruncateUninterrupted(seg_fd, entry_off);
-    }
-
+    /// After the loop, entry_off should equal the file size for a clean segment.
+    /// The only case where they differ is an incomplete tail entry (crash during write),
+    /// which was already handled with ftruncate + break inside the loop above.
     file_size = entry_off;
 
     /// seek to end of file if it is open

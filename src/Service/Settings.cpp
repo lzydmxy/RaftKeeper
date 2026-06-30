@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <limits>
 #include <Service/Settings.h>
 #include <Common/IO/WriteHelpers.h>
 #include <Common/getNumberOfPhysicalCPUCores.h>
@@ -74,9 +75,13 @@ void RaftSettings::loadFromConfig(const String & config_elem, const Poco::Util::
         client_req_timeout_ms = config.getUInt(get_key("client_req_timeout_ms"), operation_timeout_ms);
         election_timeout_lower_bound_ms = config.getUInt(get_key("election_timeout_lower_bound_ms"), Coordination::ELECTION_TIMEOUT_LOWER_BOUND_MS);
         election_timeout_upper_bound_ms = config.getUInt(get_key("election_timeout_upper_bound_ms"), Coordination::ELECTION_TIMEOUT_UPPER_BOUND_MS);
-        reserved_log_items = config.getUInt(get_key("reserved_log_items"), 1000000);
         snapshot_distance = config.getUInt(get_key("snapshot_distance"), 3000000);
-        max_stored_snapshots = config.getUInt(get_key("max_stored_snapshots"), 5);
+        max_stored_snapshots = config.getUInt(get_key("max_stored_snapshots"), 3);
+        /// Log compaction is handled by compactLogStore() in NuRaftStateMachine,
+        /// which compacts based on the oldest retained snapshot (same as ZooKeeper).
+        /// NuRaft's own compaction (based on latest snapshot - reserved_log_items)
+        /// is disabled by defaulting reserved_log_items to INT32_MAX so it never fires.
+        reserved_log_items = config.getUInt(get_key("reserved_log_items"), std::numeric_limits<int32_t>::max());
         startup_timeout = config.getUInt(get_key("startup_timeout"), 6000000);
         shutdown_timeout = config.getUInt(get_key("shutdown_timeout"), 5000);
 
@@ -110,9 +115,9 @@ RaftSettingsPtr RaftSettings::getDefault()
     settings->client_req_timeout_ms = settings->operation_timeout_ms;
     settings->election_timeout_lower_bound_ms = Coordination::ELECTION_TIMEOUT_LOWER_BOUND_MS;
     settings->election_timeout_upper_bound_ms = Coordination::ELECTION_TIMEOUT_UPPER_BOUND_MS;
-    settings->reserved_log_items = 10000000;
+    settings->reserved_log_items = std::numeric_limits<int32_t>::max(); /// disabled — compaction handled by compactLogStore() (ZooKeeper-style)
     settings->snapshot_distance = 3000000;
-    settings->max_stored_snapshots = 5;
+    settings->max_stored_snapshots = 3;
     settings->shutdown_timeout = 5000;
     settings->startup_timeout = 6000000;
 

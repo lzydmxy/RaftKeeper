@@ -22,8 +22,8 @@ ptr<log_entry> LogEntryQueue::getEntry(const UInt64 & index)
 
 void LogEntryQueue::putEntry(UInt64 & index, const ptr<log_entry> & entry)
 {
-    LOG_TRACE(log, "put entry {}, index {}, batch {}", index, index & (MAX_VECTOR_SIZE - 1), batch_index);
     std::lock_guard write_lock(queue_mutex);
+    LOG_TRACE(log, "put entry {}, index {}, batch {}", index, index & (MAX_VECTOR_SIZE - 1), batch_index);
     entry_vec[index & (MAX_VECTOR_SIZE - 1)] = entry;
     batch_index = std::max(batch_index, index >> BIT_SIZE);
     max_index = std::max(max_index, index);
