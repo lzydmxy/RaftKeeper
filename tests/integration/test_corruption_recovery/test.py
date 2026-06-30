@@ -45,15 +45,21 @@ def test_snapshot_corruption_fallback(started_cluster):
         snap_count = int(snap_files.strip())
         assert snap_count >= 2, f"Expected >=2 snapshots (object-1 files), got {snap_count}"
 
-        # Stop node1 gracefully to get clean state
+        # Stop node1 gracefully to get a clean filesystem state
         node1.stop_raftkeeper()
 
-        # Corrupt the latest snapshot's object 1 (IntMap)
-        node1.exec_in_container(
+        # Explicitly corrupt the latest snapshot's object 1 (IntMap) by overwriting
+        # it with random bytes. Object 1 is required for snapshot loading
+        # (it carries zxid, session_id_counter, OBJECTCOUNT) — corrupting it
+        # guarantees the latest snapshot fails to deserialize.
+        result = node1.exec_in_container(
             ['bash', '-c',
              'LATEST=$(ls -t /var/lib/raftkeeper/data/raft_snapshot/snapshot_*_1 | head -1); '
-             'echo "corrupting $LATEST"; '
-             '> "$LATEST"'])  # truncate IntMap to empty
+             'if [ -z "$LATEST" ]; then echo "ERROR: no snapshot object 1 found" >&2; exit 1; fi; '
+             'echo "corrupting latest snapshot: $LATEST"; '
+             'SIZE=$(stat -c%s "$LATEST"); '
+             'dd if=/dev/urandom of="$LATEST" bs=1 count="$SIZE" conv=notrunc status=none'])
+        print(f"Corruption result: {result}")
 
         # Start node1 — should fallback to an older snapshot
         node1.start_raftkeeper()
