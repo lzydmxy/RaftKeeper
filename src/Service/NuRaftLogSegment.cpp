@@ -194,6 +194,31 @@ void NuRaftLogSegment::load()
     UInt64 last_index_read = first_index - 1;
     for (; entry_off < file_size_read;)
     {
+        /// If fewer bytes remain than a full header, treat as partial-entry trailing garbage:
+        /// loadEntryHeader would otherwise short-read and surface a misleading "fail to read header" error.
+        const UInt64 bytes_remaining = file_size_read - entry_off;
+        if (bytes_remaining < LogEntryHeader::HEADER_SIZE)
+        {
+            if (!is_open)
+                throw Exception(
+                    ErrorCodes::CORRUPTED_LOG,
+                    "Closed log segment {} is corrupted: trailing {} bytes (less than header) at offset {}.",
+                    file_name,
+                    bytes_remaining,
+                    entry_off);
+
+            LOG_WARNING(
+                log,
+                "{} has trailing {} bytes (less than header size {}) at offset {}, truncating.",
+                file_name,
+                bytes_remaining,
+                LogEntryHeader::HEADER_SIZE,
+                entry_off);
+            if (ftruncate(seg_fd, entry_off) != 0)
+                throwFromErrno(ErrorCodes::CORRUPTED_LOG, "Failed to truncate trailing partial header in {}", file_name);
+            break;
+        }
+
         LogEntryHeader header = loadEntryHeader(entry_off);
 
         const UInt64 log_entry_len = sizeof(LogEntryHeader) + header.data_length;
