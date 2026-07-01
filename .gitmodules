@@ -40,3 +40,6 @@
 [submodule "contrib/llvm-project"]
 	path = contrib/llvm-project
 	url = https://github.com/llvm/llvm-project.git
+[submodule "contrib/zstd"]
+	path = contrib/zstd
+	url = https://ghfast.top/https://github.com/facebook/zstd.git

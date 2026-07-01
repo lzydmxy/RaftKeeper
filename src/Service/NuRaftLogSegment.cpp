@@ -15,6 +15,7 @@
 #include <Service/KeeperUtils.h>
 #include <Service/LogEntry.h>
 #include <Service/KeeperCommon.h>
+#include <Service/ZstdLogCodec.h>
 
 
 namespace RK
@@ -39,12 +40,13 @@ bool compareSegment(const ptr<NuRaftLogSegment> & lhs, const ptr<NuRaftLogSegmen
     return lhs->firstIndex() < rhs->firstIndex();
 }
 
-NuRaftLogSegment::NuRaftLogSegment(const String & log_dir_, UInt64 first_index_)
+NuRaftLogSegment::NuRaftLogSegment(const String & log_dir_, UInt64 first_index_, LogEntryCodec write_codec_)
     : log_dir(log_dir_)
     , first_index(first_index_)
     , last_index(first_index_ - 1)
     , is_open(true)
     , version(CURRENT_LOG_VERSION)
+    , write_codec(write_codec_)
     , log(&(Poco::Logger::get("NuRaftLogSegment")))
 {
     Poco::DateTime now;
@@ -384,22 +386,47 @@ UInt64 NuRaftLogSegment::appendEntry(const ptr<log_entry> & entry, std::atomic<U
     struct iovec vec[2];
 
     ptr<buffer> entry_buf;
+    ptr<buffer> on_disk_buf; /// [codec:1][body], written verbatim to file
     char * data_in_buf;
     {
         if (!is_open || seg_fd  == -1)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Append log but segment {} is not open.", file_name);
 
         entry_buf = LogEntryBody::serialize(entry);
-        data_in_buf = reinterpret_cast<char *>(entry_buf->data_begin());
+        char * raw_body = reinterpret_cast<char *>(entry_buf->data_begin());
+        size_t raw_body_size = entry_buf->size();
 
-        size_t data_size = entry_buf->size();
-
-        if (data_in_buf == nullptr || data_size == 0)
+        if (raw_body == nullptr || raw_body_size == 0)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Append log but it is empty");
 
+        LogEntryCodec used_codec = LogEntryCodec::RAW;
+        ptr<buffer> compressed;
+        if (write_codec == LogEntryCodec::ZSTD)
+        {
+            compressed = ZstdLogCodec::compress(raw_body, raw_body_size);
+            /// Fall back to raw if compression grew the payload (unusual but possible for tiny entries).
+            if (compressed && compressed->size() < raw_body_size)
+                used_codec = LogEntryCodec::ZSTD;
+            else
+                compressed = nullptr;
+        }
 
+        if (used_codec == LogEntryCodec::ZSTD)
+        {
+            on_disk_buf = buffer::alloc(1 + compressed->size());
+            *on_disk_buf->data_begin() = static_cast<uint8_t>(used_codec);
+            memcpy(on_disk_buf->data_begin() + 1, compressed->data_begin(), compressed->size());
+        }
+        else
+        {
+            on_disk_buf = buffer::alloc(1 + raw_body_size);
+            *on_disk_buf->data_begin() = static_cast<uint8_t>(LogEntryCodec::RAW);
+            memcpy(on_disk_buf->data_begin() + 1, raw_body, raw_body_size);
+        }
+
+        data_in_buf = reinterpret_cast<char *>(on_disk_buf->data_begin());
         header.term = entry->get_term();
-        header.data_length = data_size;
+        header.data_length = on_disk_buf->size();
         header.data_crc = RK::getCRC32(data_in_buf, header.data_length);
 
         vec[0].iov_base = &header;
@@ -473,18 +500,43 @@ ptr<log_entry> NuRaftLogSegment::loadEntry(int64_t offset) const
 {
     LogEntryHeader header = loadEntryHeader(offset);
 
+    if (header.data_length == 0)
+        throw Exception(ErrorCodes::CORRUPTED_LOG, "Zero-length payload in log segment {} at offset {}", file_name, offset);
+
     ptr<buffer> buf = buffer::alloc(header.data_length);
     ssize_t size_read = pread(seg_fd, buf->data_begin(), header.data_length, offset + LogEntryHeader::HEADER_SIZE);
 
-    if (size_read != header.data_length)
+    if (size_read != static_cast<ssize_t>(header.data_length))
         throwFromErrno(ErrorCodes::CORRUPTED_LOG, "Fail to read log entry with offset {} from log segment {}", offset, file_name);
 
     if (!verifyCRC32(reinterpret_cast<const char *>(buf->data_begin()), header.data_length, header.data_crc))
         throw Exception(ErrorCodes::CORRUPTED_LOG, "Checking CRC32 failed for log segment {}.", file_name);
 
-    auto entry = LogEntryBody::deserialize(buf);
-    entry->set_term(header.term);
+    ptr<buffer> body;
+    if (version >= LogVersion::V2)
+    {
+        /// First byte is the codec tag; body follows.
+        auto codec = static_cast<LogEntryCodec>(*buf->data_begin());
+        const char * payload = reinterpret_cast<const char *>(buf->data_begin()) + 1;
+        size_t payload_size = header.data_length - 1;
 
+        if (codec == LogEntryCodec::ZSTD)
+            body = ZstdLogCodec::decompress(payload, payload_size);
+        else
+        {
+            body = buffer::alloc(payload_size);
+            memcpy(body->data_begin(), payload, payload_size);
+            body->pos(0);
+        }
+    }
+    else
+    {
+        /// V0/V1: raw body, no codec byte.
+        body = buf;
+    }
+
+    auto entry = LogEntryBody::deserialize(body);
+    entry->set_term(header.term);
     return entry;
 }
 
@@ -577,11 +629,11 @@ bool NuRaftLogSegment::truncate(const UInt64 last_index_kept)
     return true;
 }
 
-ptr<LogSegmentStore> LogSegmentStore::getInstance(const String & log_dir_, bool force_new, UInt32 max_log_segment_file_size_)
+ptr<LogSegmentStore> LogSegmentStore::getInstance(const String & log_dir_, bool force_new, UInt32 max_log_segment_file_size_, LogEntryCodec write_codec_)
 {
     static ptr<LogSegmentStore> segment_store;
     if (segment_store == nullptr || force_new)
-        segment_store = cs_new<LogSegmentStore>(log_dir_, max_log_segment_file_size_);
+        segment_store = cs_new<LogSegmentStore>(log_dir_, max_log_segment_file_size_, write_codec_);
     return segment_store;
 }
 
@@ -641,7 +693,7 @@ void LogSegmentStore::openNewSegmentIfNeeded()
     }
 
     UInt64 next_idx = last_log_index.load(std::memory_order_acquire) + 1;
-    ptr<NuRaftLogSegment> new_seg = cs_new<NuRaftLogSegment>(log_dir, next_idx);
+    ptr<NuRaftLogSegment> new_seg = cs_new<NuRaftLogSegment>(log_dir, next_idx, write_codec);
 
     open_segment = new_seg;
     open_segment->writeHeader();

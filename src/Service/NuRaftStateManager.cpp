@@ -23,7 +23,8 @@ NuRaftStateManager::NuRaftStateManager(int32_t id_, const Poco::Util::AbstractCo
     curr_log_store = cs_new<NuRaftFileLogStore>(log_dir
         , false, settings->raft_settings->log_fsync_mode
         , settings->raft_settings->log_fsync_interval
-        , settings->raft_settings->max_log_segment_file_size);
+        , settings->raft_settings->max_log_segment_file_size
+        , settings->raft_settings->log_compression == "zstd" ? LogEntryCodec::ZSTD : LogEntryCodec::RAW);
 
     srv_state_file = fs::path(log_dir) / "srv_state";
     cluster_config_file = fs::path(log_dir) / "cluster_config";

@@ -1,0 +1,10 @@
+<raftkeeper>
+    <keeper>
+        <my_id>1</my_id>
+        <host>node</host>
+        <raft_settings>
+            <snapshot_distance>10000</snapshot_distance>
+            <log_compression>zstd</log_compression>
+        </raft_settings>
+    </keeper>
+</raftkeeper>
