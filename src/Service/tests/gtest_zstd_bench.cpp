@@ -27,7 +27,7 @@ using namespace RK;
 namespace
 {
 
-static constexpr int BENCH_ENTRY_COUNT = 5000;
+static constexpr int BENCH_ENTRY_COUNT = 1000000;
 static constexpr int KEY_BYTES = 64;
 
 /// Build a payload that resembles real ZK node data: mix of repetitive + random-ish bytes.
@@ -57,9 +57,10 @@ struct BenchResult
     UInt64 raw_bytes;
 };
 
-BenchResult runLevel(int level /* -1=raw */, const String & key, const String & data, int value_bytes)
+BenchResult runLevel(int level /* -1=raw */, const String & key, const String & data, int value_bytes, int batch_size = 1, bool sync_per_batch = false)
 {
-    String log_dir = String("./test_raft_log/zstd_bench_level_") + (level < 0 ? "none" : std::to_string(level));
+    String log_dir = String("./test_raft_log/zstd_bench_level_") + (level < 0 ? "none" : std::to_string(level))
+        + "_b" + std::to_string(batch_size) + (sync_per_batch ? "_sync" : "");
     cleanDirectory(log_dir);
 
     LogEntryCodec codec = (level < 0) ? LogEntryCodec::RAW : LogEntryCodec::ZSTD;
@@ -118,8 +119,14 @@ BenchResult runLevel(int level /* -1=raw */, const String & key, const String & 
 
     Stopwatch write_watch;
     write_watch.start();
-    for (int i = 0; i < BENCH_ENTRY_COUNT; i++)
-        appendEntry(store, 1, const_cast<String &>(key), const_cast<String &>(data));
+    for (int i = 0; i < BENCH_ENTRY_COUNT; i += batch_size)
+    {
+        int n = std::min(batch_size, BENCH_ENTRY_COUNT - i);
+        for (int j = 0; j < n; j++)
+            appendEntry(store, 1, const_cast<String &>(key), const_cast<String &>(data));
+        if (sync_per_batch)
+            store->flush(); // simulates FSYNC_PARALLEL fsyncThread waking on end_of_append_batch
+    }
     write_watch.stop();
 
     // ── 3. End-to-end read throughput ────────────────────────────────────────
@@ -168,8 +175,8 @@ TEST(ZstdLevelBench, AllLevels)
     struct PayloadCase { int value_bytes; const char * label; };
     std::vector<PayloadCase> cases = {
         {128,  "128B "},
+        {307,  "0.3KB"},
         {1024, "1KB  "},
-        {8192, "8KB  "},
     };
 
     /// Levels to benchmark: -1=none, then 1..9.
@@ -193,6 +200,30 @@ TEST(ZstdLevelBench, AllLevels)
             fprintf(stderr, "%-8s %12.1f %12.1f %8.2f %10.1f %10.1f\n",
                 level_str.c_str(), r.write_mbs, r.read_mbs, r.ratio, r.p50_us, r.p99_us);
         }
+    }
+
+    // ── Batch-size sweep: none vs zstd3, with fsync per batch ──────────────────
+    std::vector<int> batch_sizes = {1, 10, 100};
+
+    fprintf(stderr, "\n━━━━ batch sweep with fsync (none vs zstd3) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    fprintf(stderr, "%-6s %-8s %12s %12s %8s\n",
+        "batch", "codec", "write MB/s", "read MB/s", "ratio");
+    fprintf(stderr, "%s\n", std::string(52, '-').c_str());
+
+    for (auto & pc : cases)
+    {
+        String data = makeBenchData(pc.value_bytes);
+        for (int bs : batch_sizes)
+        {
+            auto r_none = runLevel(-1, key, data, pc.value_bytes, bs, /*sync_per_batch=*/true);
+            fprintf(stderr, "%-6d %-8s %12.1f %12.1f %8.2f\n",
+                bs, "none", r_none.write_mbs, r_none.read_mbs, r_none.ratio);
+
+            auto r_zstd = runLevel(3, key, data, pc.value_bytes, bs, /*sync_per_batch=*/true);
+            fprintf(stderr, "%-6d %-8s %12.1f %12.1f %8.2f\n",
+                bs, "zstd3", r_zstd.write_mbs, r_zstd.read_mbs, r_zstd.ratio);
+        }
+        fprintf(stderr, "\n");
     }
 
     /// The test always passes — it's a benchmark, not a correctness check.
