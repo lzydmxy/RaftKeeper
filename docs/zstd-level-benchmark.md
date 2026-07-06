@@ -155,5 +155,5 @@ Reading 2–5× fewer bytes from disk outweighs zstd decompression cost.
 
 ```bash
 ninja -C build rk_unit_tests
-./build/src/rk_unit_tests --gtest_filter='ZstdLevelBench.*' 2>&1
+./build/src/rk_unit_tests --gtest_also_run_disabled_tests --gtest_filter='ZstdLevelBench.*' 2>&1
 ```

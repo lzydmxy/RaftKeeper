@@ -169,7 +169,11 @@ BenchResult runLevel(int level /* -1=raw */, const String & key, const String & 
 } // namespace
 
 
-TEST(ZstdLevelBench, AllLevels)
+/// DISABLED_ prefix: this is a manual perf benchmark (1M entries x many configs),
+/// not a correctness test. gtest skips it by default in every CI job regardless of
+/// filter. Run explicitly with:
+///   ./rk_unit_tests --gtest_also_run_disabled_tests --gtest_filter='ZstdLevelBench.*'
+TEST(ZstdLevelBench, DISABLED_AllLevels)
 {
     /// Three payload sizes to show how compressibility affects the sweet spot.
     struct PayloadCase { int value_bytes; const char * label; };

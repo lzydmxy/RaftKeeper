@@ -22,9 +22,7 @@ jobs:
 
       - name: Run unit tests
         working-directory: ${{ github.workspace }}/build
-        # Exclude ZstdLevelBench: it's a manual perf benchmark (1M entries x many
-        # configs), not a correctness test, and would time out CI.
-        run: sudo chmod 755 ./src/rk_unit_tests && ./src/rk_unit_tests --gtest_color=yes --gtest_filter=-ZstdLevelBench.* --gtest_output=xml:unit-test-report-${{ inputs.sanitize }}.xml
+        run: sudo chmod 755 ./src/rk_unit_tests && ./src/rk_unit_tests --gtest_color=yes --gtest_output=xml:unit-test-report-${{ inputs.sanitize }}.xml
 
       - name: Upload test report
         if: always()
