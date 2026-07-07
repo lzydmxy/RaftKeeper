@@ -114,6 +114,8 @@ struct RaftSettings
     UInt64 max_log_segment_file_size;
     /// Log entry codec: "none" or "zstd". Applies to newly written entries; readers auto-detect per-entry.
     String log_compression;
+    /// Snapshot codec: "none" (V2) or "zstd" (V3). Applies to newly written snapshots; readers auto-detect via version byte.
+    String snapshot_compression;
     /// Whether async snapshot
     bool async_snapshot;
 

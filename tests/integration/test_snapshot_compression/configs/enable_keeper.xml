@@ -1,0 +1,12 @@
+<raftkeeper>
+    <keeper>
+        <my_id>1</my_id>
+        <host>node</host>
+        <create_snapshot_on_exit>0</create_snapshot_on_exit>
+        <raft_settings>
+            <snapshot_distance>20</snapshot_distance>
+            <async_snapshot>false</async_snapshot>
+            <snapshot_compression>zstd</snapshot_compression>
+        </raft_settings>
+    </keeper>
+</raftkeeper>

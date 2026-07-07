@@ -317,14 +317,14 @@ public:
 
     size_t createSnapshotAsync(
         SnapTask & snap_task,
-        SnapshotVersion version = CURRENT_SNAPSHOT_VERSION);
+        SnapshotVersion version = SnapshotVersion::V2);
 
     size_t createSnapshot(
         snapshot & meta,
         KeeperStore & store,
         int64_t next_zxid = 0,
         int64_t next_session_id = 0,
-        SnapshotVersion version = CURRENT_SNAPSHOT_VERSION);
+        SnapshotVersion version = SnapshotVersion::V2);
 
     /// save snapshot meta, invoked when we receive an snapshot from leader.
     bool receiveSnapshotMeta(snapshot & meta);

@@ -8,6 +8,7 @@
 #include <Service/ReadBufferFromNuRaftBuffer.h>
 #include <Service/SnapshotCommon.h>
 #include <Service/WriteBufferFromNuraftBuffer.h>
+#include <Service/ZstdLogCodec.h>
 #include <ZooKeeper/ZooKeeperIO.h>
 
 namespace RK
@@ -30,6 +31,8 @@ String toString(SnapshotVersion version)
             return "v1";
         case SnapshotVersion::V2:
             return "v2";
+        case SnapshotVersion::V3:
+            return "v3";
         case SnapshotVersion::UNKNOWN:
             return "unknown";
     }
@@ -153,12 +156,20 @@ ptr<KeeperNodeWithPath>parseKeeperNode(const String & buf, SnapshotVersion versi
 }
 
 
-std::pair<size_t, UInt32> saveBatchV2(ptr<WriteBufferFromFile> & out, ptr<SnapshotBatchBody> & batch)
+std::pair<size_t, UInt32> saveBatchV2(ptr<WriteBufferFromFile> & out, ptr<SnapshotBatchBody> & batch, SnapshotVersion version)
 {
     if (!batch)
         batch = cs_new<SnapshotBatchBody>();
 
     String str_buf = SnapshotBatchBody::serialize(*batch);
+
+    if (version >= SnapshotVersion::V3)
+    {
+        auto compressed = ZstdLogCodec::compress(str_buf.data(), str_buf.size());
+        if (!compressed)
+            throw Exception(ErrorCodes::CORRUPTED_SNAPSHOT, "Failed to zstd-compress snapshot batch");
+        str_buf.assign(reinterpret_cast<const char *>(compressed->data_begin()), compressed->size());
+    }
 
     SnapshotBatchHeader header;
     header.data_length = str_buf.size();
@@ -174,9 +185,9 @@ std::pair<size_t, UInt32> saveBatchV2(ptr<WriteBufferFromFile> & out, ptr<Snapsh
 }
 
 std::pair<size_t, UInt32>
-saveBatchAndUpdateCheckSumV2(ptr<WriteBufferFromFile> & out, ptr<SnapshotBatchBody> & batch, UInt32 checksum)
+saveBatchAndUpdateCheckSumV2(ptr<WriteBufferFromFile> & out, ptr<SnapshotBatchBody> & batch, UInt32 checksum, SnapshotVersion version)
 {
-    auto [save_size, data_crc] = saveBatchV2(out, batch);
+    auto [save_size, data_crc] = saveBatchV2(out, batch, version);
     /// rebuild batch
     batch = cs_new<SnapshotBatchBody>();
     return {save_size, updateCheckSum(checksum, data_crc)};
@@ -203,7 +214,7 @@ void serializeAclsV2(const NumToACLMap & acl_map, String path, UInt32 save_batch
             if (index != 0)
             {
                 /// write data in batch to file
-                auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum);
+                auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum, version);
                 checksum = new_checksum;
             }
             batch = cs_new<SnapshotBatchBody>();
@@ -223,7 +234,7 @@ void serializeAclsV2(const NumToACLMap & acl_map, String path, UInt32 save_batch
     }
 
     /// flush the last acl batch
-    auto [_, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum);
+    auto [_, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum, version);
     checksum = new_checksum;
 
     writeTailAndClose(out, checksum);
@@ -251,7 +262,7 @@ void serializeSessionsV2(SessionAndTimeout & session_and_timeout, SessionAndAuth
             if (index != 0)
             {
                 /// write data in batch to file
-                auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum);
+                auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum, version);
                 checksum = new_checksum;
             }
             batch = cs_new<SnapshotBatchBody>();
@@ -276,7 +287,7 @@ void serializeSessionsV2(SessionAndTimeout & session_and_timeout, SessionAndAuth
     }
 
     /// flush the last batch
-    auto [_, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum);
+    auto [_, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum, version);
     checksum = new_checksum;
     writeTailAndClose(out, checksum);
 }
@@ -302,7 +313,7 @@ void serializeMapV2(T & snap_map, UInt32 save_batch_size, SnapshotVersion versio
             if (index != 0)
             {
                 /// write data in batch to file
-                auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum);
+                auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum, version);
                 checksum = new_checksum;
             }
 
@@ -328,7 +339,7 @@ void serializeMapV2(T & snap_map, UInt32 save_batch_size, SnapshotVersion versio
     }
 
     /// flush the last batch
-    auto [_, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum);
+    auto [_, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum, version);
     checksum = new_checksum;
     writeTailAndClose(out, checksum);
 }

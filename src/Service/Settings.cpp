@@ -95,6 +95,7 @@ void RaftSettings::loadFromConfig(const String & config_elem, const Poco::Util::
         log_fsync_interval = config.getUInt(get_key("log_fsync_interval"), 1000);
         max_log_segment_file_size = config.getUInt(get_key("max_log_segment_file_size"), 1073741824);
         log_compression = config.getString(get_key("log_compression"), "none");
+        snapshot_compression = config.getString(get_key("snapshot_compression"), "none");
         async_snapshot = config.getBool(get_key("async_snapshot"), true);
     }
     catch (Exception & e)
@@ -130,6 +131,7 @@ RaftSettingsPtr RaftSettings::getDefault()
     settings->log_fsync_interval = 1000;
     settings->max_log_segment_file_size = 1073741824;
     settings->log_compression = "none";
+    settings->snapshot_compression = "none";
     settings->log_fsync_mode = FsyncMode::FSYNC_PARALLEL;
     settings->async_snapshot = true;
 
@@ -241,6 +243,10 @@ void Settings::dump(WriteBufferFromOwnString & buf) const
 
     writeText("log_compression=", buf);
     writeText(raft_settings->log_compression, buf);
+    buf.write('\n');
+
+    writeText("snapshot_compression=", buf);
+    writeText(raft_settings->snapshot_compression, buf);
     buf.write('\n');
 
     writeText("nuraft_thread_size=", buf);

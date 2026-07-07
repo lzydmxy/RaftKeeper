@@ -676,6 +676,15 @@ TEST(RaftSnapshot, parseSnapshot)
 
     parseSnapshot(SnapshotVersion::V2, SnapshotVersion::V1);
     sleep(1);
+
+    parseSnapshot(SnapshotVersion::V3, SnapshotVersion::V3);
+    sleep(1);
+
+    parseSnapshot(SnapshotVersion::V2, SnapshotVersion::V3);
+    sleep(1);
+
+    parseSnapshot(SnapshotVersion::V3, SnapshotVersion::V2);
+    sleep(1);
 }
 
 TEST(RaftSnapshot, parseIncompleteSnapshot)
