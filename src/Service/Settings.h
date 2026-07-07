@@ -112,6 +112,8 @@ struct RaftSettings
     UInt64 log_fsync_interval;
     /// We store logs in multiple file, this setting represent the max single log segment file size in bytes.
     UInt64 max_log_segment_file_size;
+    /// Log entry codec: "none" or "zstd". Applies to newly written entries; readers auto-detect per-entry.
+    String log_compression;
     /// Whether async snapshot
     bool async_snapshot;
 

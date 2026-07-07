@@ -25,8 +25,16 @@ enum class LogVersion : uint8_t
 {
     V0 = 0,
     V1 = 1, /// with ctime, mtime, magic and version
+    V2 = 2, /// V1 layout + per-entry codec byte prefix (0=raw, 1=zstd)
 
     UNKNOWN = 255
+};
+
+/// Codec byte placed at the start of every V2 payload.
+enum class LogEntryCodec : uint8_t
+{
+    RAW = 0,
+    ZSTD = 1,
 };
 
 /// Attach version to log entry
@@ -36,13 +44,13 @@ struct LogEntryWithVersion
     ptr<log_entry> entry;
 };
 
-static constexpr auto CURRENT_LOG_VERSION = LogVersion::V1;
+static constexpr auto CURRENT_LOG_VERSION = LogVersion::V2;
 
 class NuRaftLogSegment
 {
 public:
     /// For new open segment
-    NuRaftLogSegment(const String & log_dir_, UInt64 first_index_);
+    NuRaftLogSegment(const String & log_dir_, UInt64 first_index_, LogEntryCodec write_codec_ = LogEntryCodec::RAW);
 
     /// For existing closed segment
     NuRaftLogSegment(const String & log_dir_, UInt64 first_index_, UInt64 last_index_, const String & file_name_, const String & create_time_);
@@ -156,6 +164,10 @@ private:
     /// file format version, default is V1
     LogVersion version;
 
+    /// Codec used for entries appended by this process. Only meaningful for open segments;
+    /// readers pick the codec from the per-entry byte, so mixed-codec segments are fine.
+    LogEntryCodec write_codec = LogEntryCodec::RAW;
+
     Poco::Logger * log;
 };
 
@@ -176,16 +188,17 @@ public:
     static constexpr UInt64 MAX_LOG_SEGMENT_FILE_SIZE = 1024 * 1024 * 1024; /// 1GB, 0.3K/Log, 3M logs
     static constexpr size_t LOAD_THREAD_NUM = 8;
 
-    explicit LogSegmentStore(const String & log_dir_, UInt64 max_log_segment_file_size_ = MAX_LOG_SEGMENT_FILE_SIZE)
+    explicit LogSegmentStore(const String & log_dir_, UInt64 max_log_segment_file_size_ = MAX_LOG_SEGMENT_FILE_SIZE, LogEntryCodec write_codec_ = LogEntryCodec::RAW)
         : log_dir(log_dir_)
         , first_log_index(1)
         , last_log_index(0)
         , max_log_segment_file_size(max_log_segment_file_size_)
+        , write_codec(write_codec_)
         , log(&Poco::Logger::get("LogSegmentStore"))
     {
     }
 
-    static ptr<LogSegmentStore> getInstance(const String & log_dir, bool force_new = false, UInt32 max_log_segment_file_size_ = MAX_LOG_SEGMENT_FILE_SIZE);
+    static ptr<LogSegmentStore> getInstance(const String & log_dir, bool force_new = false, UInt32 max_log_segment_file_size_ = MAX_LOG_SEGMENT_FILE_SIZE, LogEntryCodec write_codec_ = LogEntryCodec::RAW);
 
     /// Init log store, will create dir if not exist
     void init();
@@ -250,6 +263,9 @@ private:
 
     /// max segment file size
     UInt32 max_log_segment_file_size;
+
+    /// Codec applied to entries written by this process (readers auto-detect per-entry).
+    LogEntryCodec write_codec;
 
     Poco::Logger * log;
 

@@ -33,6 +33,20 @@ def wait_nodes():
         wait_node(n)
 
 
+def wait_for_leader(timeout=30):
+    """Session recovery (UpdateSession) is a Raft write and needs an elected
+    leader. wait_for_join_cluster only checks readability, which a follower
+    serves without a leader, so we must additionally wait for a leader to
+    settle after a full-cluster restart."""
+    import time
+    start = time.time()
+    while time.time() - start < timeout:
+        if any(n.is_leader() for n in [node1, node2, node3]):
+            return
+        time.sleep(0.5)
+    raise Exception("No leader elected within timeout after cluster restart")
+
+
 # get client with retry policy
 def get_fake_zk(node_name, timeout=30.0):
     _fake_zk_instance = KazooClient(hosts=cluster.get_instance_ip(node_name) + ":8101", timeout=timeout)
@@ -43,11 +57,17 @@ def get_fake_zk(node_name, timeout=30.0):
 
 def restart_cluster(zk, first_session_id):
     print("Restarting cluster, client previous session id is ", first_session_id)
-    node1.restart_raftkeeper()
-    node2.restart_raftkeeper()
-    node3.restart_raftkeeper()
-
-    wait_nodes()
+    # Rolling restart: restart one node at a time, waiting for it to rejoin and
+    # for a leader to be present before moving on. Restarting all three at once
+    # leaves the cluster without a quorum (hence no leader) for several seconds;
+    # during that window the client's UpdateSession requests time out until the
+    # client gives up and starts a NEW session, changing its session id and
+    # failing the assertion. Keeping a majority alive at all times means a leader
+    # always exists, so the client always recovers its original session.
+    for node in [node1, node2, node3]:
+        node.restart_raftkeeper()
+        node.wait_for_join_cluster()
+        wait_for_leader()
     print("Cluster started client session id is ", zk._session_id)
 
 

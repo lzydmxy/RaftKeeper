@@ -139,6 +139,10 @@
 
             <!-- Max single log segment file size, default is 1G. -->
             <!-- <max_log_segment_file_size>1073741824</max_log_segment_file_size> -->
+
+            <!-- Log entry compression codec. "none" (default) or "zstd".
+                 Applies only to newly written entries; existing segments are always readable. -->
+            <!-- <log_compression>none</log_compression> -->
         </raft_settings>
 
         <!-- If you want a RaftKeeper cluster, you can uncomment this and configure it carefully -->

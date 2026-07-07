@@ -6,6 +6,7 @@
 #include <Service/KeeperUtils.h>
 #include <Service/LogEntry.h>
 #include <Service/NuRaftFileLogStore.h>
+#include <Service/ZstdLogCodec.h>
 #include <Service/tests/raft_test_common.h>
 
 
@@ -430,4 +431,87 @@ int main(int argc, char ** argv)
     int ret = RUN_ALL_TESTS();
     //delete thread_env;
     return ret;
+}
+
+
+/// ── Zstd codec unit tests ──────────────────────────────────────────────────
+
+TEST(RaftLogZstd, codecRoundTrip)
+{
+    String payload(1024, 'A'); /// compressible data
+    auto compressed = ZstdLogCodec::compress(payload.data(), payload.size());
+    ASSERT_NE(compressed, nullptr);
+    ASSERT_LT(compressed->size(), payload.size()); /// must actually compress
+
+    auto decompressed = ZstdLogCodec::decompress(
+        reinterpret_cast<const char *>(compressed->data_begin()), compressed->size());
+    ASSERT_EQ(decompressed->size(), payload.size());
+    ASSERT_EQ(memcmp(decompressed->data_begin(), payload.data(), payload.size()), 0);
+}
+
+TEST(RaftLogZstd, appendAndReadZstdEntries)
+{
+    String log_dir(LOG_DIR + "/zstd1");
+    cleanDirectory(log_dir);
+    auto log_store = LogSegmentStore::getInstance(log_dir, true,
+        LogSegmentStore::MAX_LOG_SEGMENT_FILE_SIZE, LogEntryCodec::ZSTD);
+    ASSERT_NO_THROW(log_store->init());
+
+    UInt64 term = 1;
+    String key("/ck/table/table_zstd");
+    String data(512, 'X'); /// compressible
+
+    for (int i = 0; i < 5; i++)
+        ASSERT_EQ(appendEntry(log_store, term, key, data), static_cast<UInt64>(i + 1));
+
+    for (int i = 0; i < 5; i++)
+    {
+        auto entry = log_store->getEntry(i + 1);
+        ASSERT_NE(entry, nullptr);
+        ASSERT_EQ(entry->get_term(), term);
+        auto req = getZookeeperCreateRequest(entry);
+        ASSERT_EQ(req->path, key);
+        ASSERT_EQ(req->data, data);
+    }
+
+    ASSERT_NO_THROW(log_store->close());
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftLogZstd, mixedCodecReadback)
+{
+    /// Write some entries uncompressed, then reopen with zstd, write more, read all back.
+    String log_dir(LOG_DIR + "/zstd2");
+    cleanDirectory(log_dir);
+
+    String key("/ck/table/t");
+    String data("hello world from raft");
+
+    {
+        auto store = LogSegmentStore::getInstance(log_dir, true,
+            LogSegmentStore::MAX_LOG_SEGMENT_FILE_SIZE, LogEntryCodec::RAW);
+        ASSERT_NO_THROW(store->init());
+        for (int i = 0; i < 3; i++)
+            appendEntry(store, 1, key, data);
+        ASSERT_NO_THROW(store->close());
+    }
+    {
+        auto store = LogSegmentStore::getInstance(log_dir, true,
+            LogSegmentStore::MAX_LOG_SEGMENT_FILE_SIZE, LogEntryCodec::ZSTD);
+        ASSERT_NO_THROW(store->init());
+        for (int i = 0; i < 3; i++)
+            appendEntry(store, 1, key, data);
+
+        /// All 6 entries must be readable regardless of their codec.
+        for (int i = 1; i <= 6; i++)
+        {
+            auto entry = store->getEntry(i);
+            ASSERT_NE(entry, nullptr) << "entry " << i << " is null";
+            auto req = getZookeeperCreateRequest(entry);
+            ASSERT_EQ(req->path, key);
+            ASSERT_EQ(req->data, data);
+        }
+        ASSERT_NO_THROW(store->close());
+    }
+    cleanDirectory(log_dir);
 }

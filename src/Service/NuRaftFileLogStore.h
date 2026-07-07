@@ -53,7 +53,8 @@ class NuRaftFileLogStore : public nuraft::log_store
          bool force_new = false,
          FsyncMode log_fsync_mode_ = FsyncMode::FSYNC_PARALLEL,
          UInt64 log_fsync_interval_ = 1000,
-         UInt64 max_log_segment_file_size_ = LogSegmentStore::MAX_LOG_SEGMENT_FILE_SIZE);
+         UInt64 max_log_segment_file_size_ = LogSegmentStore::MAX_LOG_SEGMENT_FILE_SIZE,
+         LogEntryCodec write_codec_ = LogEntryCodec::RAW);
 
     ~NuRaftFileLogStore() override;
 

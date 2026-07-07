@@ -82,6 +82,7 @@ target_link_libraries(rk_common_io
 )
 
 target_link_libraries(rk PUBLIC ${NURAFT_LIBRARY})
+target_link_libraries(rk PRIVATE rk_contrib::zstd)
 
 
 if(RE2_INCLUDE_DIR)
@@ -133,6 +134,7 @@ if (ENABLE_TESTS AND USE_GTEST)
     target_link_libraries(rk_unit_tests PRIVATE ${GTEST_BOTH_LIBRARIES}
         rk
         rk_zookeeper
-        loggers)
+        loggers
+        rk_contrib::zstd)
     add_check(rk_unit_tests)
 endif ()
