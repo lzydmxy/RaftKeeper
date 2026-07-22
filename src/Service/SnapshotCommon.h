@@ -44,12 +44,13 @@ enum class SnapshotVersion : uint8_t
 String toString(SnapshotVersion version);
 
 
-static constexpr auto CURRENT_SNAPSHOT_VERSION = SnapshotVersion::V3;
+/// Maximum snapshot version we can read (write default is V2 for rolling-upgrade safety).
+static constexpr auto MAX_SNAPSHOT_VERSION = SnapshotVersion::V3;
 
 /// Batch data header in a snapshot object file.
 struct SnapshotBatchHeader
 {
-    /// The length of the batch data (uncompressed)
+    /// The length of the batch data on disk (compressed if V3+, raw otherwise)
     UInt32 data_length;
     /// The CRC32C of the batch data.
     /// If compression is enabled, this is the checksum of the compressed data.

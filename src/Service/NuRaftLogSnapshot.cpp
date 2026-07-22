@@ -471,7 +471,7 @@ void KeeperSnapshotStore::parseObject(KeeperStore & store, String obj_path, Buck
             snap_fs->read(buf, sizeof(uint8_t));
             read_size += 1;
             LOG_DEBUG(log, "Got snapshot file header with version {}", toString(version_from_obj));
-            if (version_from_obj > CURRENT_SNAPSHOT_VERSION)
+            if (version_from_obj > MAX_SNAPSHOT_VERSION)
                 throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION, "Unsupported snapshot version {}", toString(version_from_obj));
         }
         else if (isSnapshotFileTail(magic))
@@ -520,8 +520,16 @@ void KeeperSnapshotStore::parseObject(KeeperStore & store, String obj_path, Buck
 
         if (version_from_obj >= SnapshotVersion::V3)
         {
-            auto decompressed = ZstdLogCodec::decompress(body_string.data(), body_string.size());
-            body_string.assign(reinterpret_cast<const char *>(decompressed->data_begin()), decompressed->size());
+            try
+            {
+                auto decompressed = ZstdLogCodec::decompress(body_string.data(), body_string.size());
+                body_string.assign(reinterpret_cast<const char *>(decompressed->data_begin()), decompressed->size());
+            }
+            catch (Exception & e)
+            {
+                e.addMessage("Can't decompress snapshot object " + obj_path);
+                throw;
+            }
         }
 
         parseBatchBodyV2(store, body_string, buckets_edges, bucket_nodes, version_from_obj);

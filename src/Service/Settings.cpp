@@ -97,6 +97,11 @@ void RaftSettings::loadFromConfig(const String & config_elem, const Poco::Util::
         log_compression = config.getString(get_key("log_compression"), "none");
         snapshot_compression = config.getString(get_key("snapshot_compression"), "none");
         async_snapshot = config.getBool(get_key("async_snapshot"), true);
+
+        if (log_compression != "none" && log_compression != "zstd")
+            LOG_WARNING(log, "Unknown log_compression '{}' — valid values are 'none' and 'zstd'. Falling back to no compression.", log_compression);
+        if (snapshot_compression != "none" && snapshot_compression != "zstd")
+            LOG_WARNING(log, "Unknown snapshot_compression '{}' — valid values are 'none' and 'zstd'. Falling back to no compression.", snapshot_compression);
     }
     catch (Exception & e)
     {

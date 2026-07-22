@@ -135,7 +135,7 @@ public:
         snapshot & meta,
         UInt32 max_object_node_size_ = MAX_OBJECT_NODE_SIZE,
         UInt32 save_batch_size_ = SAVE_BATCH_SIZE,
-        SnapshotVersion version_ = CURRENT_SNAPSHOT_VERSION)
+        SnapshotVersion version_ = SnapshotVersion::V2)
         : version(version_)
         , snap_dir(snap_dir_)
         , max_object_node_size(max_object_node_size_)
