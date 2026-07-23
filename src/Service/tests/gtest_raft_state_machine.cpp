@@ -662,3 +662,213 @@ TEST(RaftStateMachine, MultiReadAuthCheckPerSubrequest)
     cleanDirectory(snap_dir);
     cleanDirectory(log_dir);
 }
+
+TEST(RaftStateMachine, RemoveRecursive)
+{
+    String snap_dir(SNAP_DIR + "/rem_rec");
+    String log_dir(LOG_DIR + "/rem_rec");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+
+    /// Build: /a -> /a/b, /a/b/c, /a/d
+    setNode(machine.getStore(), "a", "root", false, session_id);
+    setNode(machine.getStore(), "a/b", "child_b", false, session_id);
+    setNode(machine.getStore(), "a/b/c", "grandchild", false, session_id);
+    setNode(machine.getStore(), "a/d", "child_d", false, session_id);
+    ASSERT_TRUE(machine.getStore().getNode("/a") != nullptr);
+    ASSERT_TRUE(machine.getStore().getNode("/a/b/c") != nullptr);
+
+    auto req = cs_new<ZooKeeperRemoveRecursiveRequest>();
+    req->path = "/a";
+    req->xid = 1;
+
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(
+        response_queue, {req, session_id, time}, {}, true, false);
+
+    ASSERT_EQ(machine.getStore().getNode("/a"), nullptr);
+    ASSERT_EQ(machine.getStore().getNode("/a/b"), nullptr);
+    ASSERT_EQ(machine.getStore().getNode("/a/b/c"), nullptr);
+    ASSERT_EQ(machine.getStore().getNode("/a/d"), nullptr);
+
+    ResponseForSession r;
+    ASSERT_TRUE(response_queue.tryPop(r));
+    ASSERT_EQ(r.response->error, Error::ZOK);
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, TryRemove)
+{
+    String snap_dir(SNAP_DIR + "/tryrem");
+    String log_dir(LOG_DIR + "/tryrem");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+    setNode(machine.getStore(), "exists_node", "data", false, session_id);
+
+    /// TryRemove existing node
+    {
+        auto req = cs_new<ZooKeeperRemoveRequest>();
+        req->path = "/exists_node";
+        req->try_remove = true;
+        req->xid = 1;
+
+        KeeperStore::KeeperResponsesQueue response_queue;
+        int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+        machine.getStore().processRequest(response_queue, {req, session_id, time}, {}, true, false);
+
+        ResponseForSession r;
+        ASSERT_TRUE(response_queue.tryPop(r));
+        ASSERT_EQ(r.response->error, Error::ZOK);
+        ASSERT_EQ(machine.getStore().getNode("/exists_node"), nullptr);
+    }
+
+    /// TryRemove nonexistent — succeeds
+    {
+        auto req = cs_new<ZooKeeperRemoveRequest>();
+        req->path = "/nonexistent";
+        req->try_remove = true;
+        req->xid = 2;
+
+        KeeperStore::KeeperResponsesQueue response_queue;
+        int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+        machine.getStore().processRequest(response_queue, {req, session_id, time}, {}, true, false);
+
+        ResponseForSession r;
+        ASSERT_TRUE(response_queue.tryPop(r));
+        ASSERT_EQ(r.response->error, Error::ZOK);
+    }
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, CheckStat)
+{
+    String snap_dir(SNAP_DIR + "/chkstat");
+    String log_dir(LOG_DIR + "/chkstat");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+    setNode(machine.getStore(), "check_node", "data", false, session_id);
+
+    auto node = machine.getStore().getNode("/check_node");
+    int32_t v = node->stat.version;
+    int32_t cv = node->stat.cversion;
+    int32_t av = node->stat.aversion;
+
+    /// Matching stat
+    {
+        auto req = cs_new<ZooKeeperCheckStatRequest>();
+        req->path = "/check_node";
+        req->version = v;
+        req->cversion = cv;
+        req->aversion = av;
+        req->xid = 1;
+
+        KeeperStore::KeeperResponsesQueue response_queue;
+        int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+        machine.getStore().processRequest(response_queue, {req, session_id, time}, {}, true, false);
+
+        ResponseForSession r;
+        ASSERT_TRUE(response_queue.tryPop(r));
+        ASSERT_EQ(r.response->error, Error::ZOK);
+    }
+
+    /// Wrong version
+    {
+        auto req = cs_new<ZooKeeperCheckStatRequest>();
+        req->path = "/check_node";
+        req->version = v + 1;
+        req->cversion = -1;
+        req->aversion = -1;
+        req->xid = 2;
+
+        KeeperStore::KeeperResponsesQueue response_queue;
+        int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+        machine.getStore().processRequest(response_queue, {req, session_id, time}, {}, true, false);
+
+        ResponseForSession r;
+        ASSERT_TRUE(response_queue.tryPop(r));
+        ASSERT_EQ(r.response->error, Error::ZBADVERSION);
+    }
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, ListRecursive)
+{
+    String snap_dir(SNAP_DIR + "/listrec");
+    String log_dir(LOG_DIR + "/listrec");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+
+    /// Build: /subtree -> /subtree/x, /subtree/y, /subtree/y/z
+    setNode(machine.getStore(), "subtree", "root", false, session_id);
+    setNode(machine.getStore(), "subtree/x", "x_data", false, session_id);
+    setNode(machine.getStore(), "subtree/y", "y_data", false, session_id);
+    setNode(machine.getStore(), "subtree/y/z", "z_data", false, session_id);
+
+    auto req = cs_new<ZooKeeperListRecursiveRequest>();
+    req->path = "/subtree";
+    req->xid = 1;
+
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(response_queue, {req, session_id, time}, {}, true, false);
+
+    ResponseForSession r;
+    ASSERT_TRUE(response_queue.tryPop(r));
+    ASSERT_EQ(r.response->error, Error::ZOK);
+
+    auto & list_resp = dynamic_cast<ZooKeeperListRecursiveResponse &>(*r.response);
+    std::vector<String> names;
+    for (auto it = list_resp.names.begin(); it != list_resp.names.end(); ++it)
+        names.emplace_back(*it);
+    std::sort(names.begin(), names.end());
+    ASSERT_EQ(names.size(), 3u);
+    ASSERT_EQ(names[0], "/subtree/x");
+    ASSERT_EQ(names[1], "/subtree/y");
+    ASSERT_EQ(names[2], "/subtree/y/z");
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}

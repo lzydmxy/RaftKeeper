@@ -30,6 +30,11 @@ static const std::unordered_set<int32_t> VALID_OPERATIONS =
     static_cast<int32_t>(OpNum::FilteredList),
     static_cast<int32_t>(OpNum::CheckNotExists),
     static_cast<int32_t>(OpNum::CreateIfNotExists),
+    static_cast<int32_t>(OpNum::RemoveRecursive),
+    static_cast<int32_t>(OpNum::CheckStat),
+    static_cast<int32_t>(OpNum::TryRemove),
+    static_cast<int32_t>(OpNum::FilteredListWithStatsAndData),
+    static_cast<int32_t>(OpNum::ListRecursive),
     static_cast<int32_t>(OpNum::UpdateSession),
 };
 
@@ -87,6 +92,16 @@ std::string toString(OpNum op_num)
             return "CheckNotExists";
         case OpNum::CreateIfNotExists:
             return "CreateIfNotExists";
+        case OpNum::RemoveRecursive:
+            return "RemoveRecursive";
+        case OpNum::CheckStat:
+            return "CheckStat";
+        case OpNum::TryRemove:
+            return "TryRemove";
+        case OpNum::FilteredListWithStatsAndData:
+            return "FilteredListWithStatsAndData";
+        case OpNum::ListRecursive:
+            return "ListRecursive";
     }
     int32_t raw_op = static_cast<int32_t>(op_num);
     throw Exception("Operation " + std::to_string(raw_op) + " is unknown", Error::ZUNIMPLEMENTED);

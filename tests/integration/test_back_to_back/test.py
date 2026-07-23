@@ -948,3 +948,69 @@ def test_multi_read_subrequest_watch(started_cluster):
 
     finally:
         close_zk_clients([fake_zk])
+
+
+def test_remove_recursive(started_cluster):
+    fake_zk = None
+    try:
+        fake_zk = get_fake_zk(True)
+        fake_zk.start()
+
+        fake_zk.create('/test_rem_rec')
+        fake_zk.create('/test_rem_rec/a', b'data_a')
+        fake_zk.create('/test_rem_rec/a/aa', b'data_aa')
+        fake_zk.create('/test_rem_rec/b', b'data_b')
+        fake_zk.create('/test_rem_rec/c', b'data_c')
+
+        assert fake_zk.exists('/test_rem_rec/a/aa') is not None
+
+        fake_zk.remove_recursive('/test_rem_rec')
+
+        assert fake_zk.exists('/test_rem_rec') is None
+        assert fake_zk.exists('/test_rem_rec/a') is None
+        assert fake_zk.exists('/test_rem_rec/a/aa') is None
+        assert fake_zk.exists('/test_rem_rec/b') is None
+
+    finally:
+        close_zk_clients([fake_zk])
+
+
+def test_try_remove(started_cluster):
+    fake_zk = None
+    try:
+        fake_zk = get_fake_zk(True)
+        fake_zk.start()
+
+        fake_zk.create('/test_tryrem')
+        fake_zk.create('/test_tryrem/exists', b'data')
+
+        # try_remove on existing node — succeeds
+        fake_zk.try_remove('/test_tryrem/exists')
+        assert fake_zk.exists('/test_tryrem/exists') is None
+
+        # try_remove on nonexistent node — succeeds (no error)
+        fake_zk.try_remove('/test_tryrem/nonexistent')
+
+    finally:
+        close_zk_clients([fake_zk])
+
+
+def test_list_recursive(started_cluster):
+    fake_zk = None
+    try:
+        fake_zk = get_fake_zk(True)
+        fake_zk.start()
+
+        fake_zk.create('/test_listrec')
+        fake_zk.create('/test_listrec/x', b'x_data')
+        fake_zk.create('/test_listrec/y', b'y_data')
+        fake_zk.create('/test_listrec/y/z', b'z_data')
+
+        names = fake_zk.list_recursive('/test_listrec')
+        assert len(names) == 3
+        assert '/test_listrec/x' in names
+        assert '/test_listrec/y' in names
+        assert '/test_listrec/y/z' in names
+
+    finally:
+        close_zk_clients([fake_zk])

@@ -246,6 +246,8 @@ struct RemoveRequest : virtual Request
 {
     String path;
     int32_t version = -1;
+    /// If true, don't error when the node doesn't exist (TryRemove semantics)
+    bool try_remove = false;
 
     void addRootPath(const String & root_path) override;
     String getPath() const override { return path; }
@@ -350,6 +352,50 @@ struct MultiResponse : virtual Response
 /// This response may be received only as an element of responses in MultiResponse.
 struct ErrorResponse : virtual Response
 {
+};
+
+struct RemoveRecursiveRequest : virtual Request
+{
+    String path;
+    /// Limit on the number of nodes removed in one call. 0 means unlimited.
+    uint32_t remove_nodes_limit = 0;
+
+    void addRootPath(const String & root_path) override;
+    String getPath() const override { return path; }
+};
+
+struct RemoveRecursiveResponse : virtual Response
+{
+};
+
+struct CheckStatRequest : virtual Request
+{
+    String path;
+    int32_t version = -1;
+    int32_t cversion = -1;
+    int32_t aversion = -1;
+
+    void addRootPath(const String & root_path) override;
+    String getPath() const override { return path; }
+};
+
+struct CheckStatResponse : virtual Response
+{
+};
+
+struct ListRecursiveRequest : virtual Request
+{
+    String path;
+    /// Maximum number of entries to return. 0 means unlimited.
+    uint32_t max_entries = 0;
+
+    void addRootPath(const String & root_path) override;
+    String getPath() const override { return path; }
+};
+
+struct ListRecursiveResponse : virtual Response
+{
+    CompactStrings names;
 };
 
 

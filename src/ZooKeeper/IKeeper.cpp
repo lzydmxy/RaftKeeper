@@ -145,6 +145,9 @@ void ListRequest::addRootPath(const String & root_path) { Coordination::addRootP
 void CheckRequest::addRootPath(const String & root_path) { Coordination::addRootPath(path, root_path); }
 void SetACLRequest::addRootPath(const String & root_path) { Coordination::addRootPath(path, root_path); }
 void GetACLRequest::addRootPath(const String & root_path) { Coordination::addRootPath(path, root_path); }
+void RemoveRecursiveRequest::addRootPath(const String & root_path) { Coordination::addRootPath(path, root_path); }
+void CheckStatRequest::addRootPath(const String & root_path) { Coordination::addRootPath(path, root_path); }
+void ListRecursiveRequest::addRootPath(const String & root_path) { Coordination::addRootPath(path, root_path); }
 
 void MultiRequest::addRootPath(const String & root_path)
 {

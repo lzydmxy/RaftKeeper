@@ -198,6 +198,54 @@ class GetChildren3(namedtuple('GetChildren3', 'path watcher list_type'), GetChil
         return children, stat
 
 
+class RemoveRecursive(namedtuple('RemoveRecursive', 'path remove_nodes_limit')):
+    type = 503
+
+    def serialize(self):
+        b = bytearray()
+        b.extend(write_string(self.path))
+        b.extend(struct.pack('!I', self.remove_nodes_limit))
+        return b
+
+    @classmethod
+    def deserialize(cls, bytes, offset):
+        return True
+
+
+class TryRemove(namedtuple('TryRemove', 'path version')):
+    type = 505
+
+    def serialize(self):
+        b = bytearray()
+        b.extend(write_string(self.path))
+        b.extend(struct.pack('!i', self.version))
+        return b
+
+    @classmethod
+    def deserialize(cls, bytes, offset):
+        return True
+
+
+class ListRecursive(namedtuple('ListRecursive', 'path max_entries')):
+    type = 507
+
+    def serialize(self):
+        b = bytearray()
+        b.extend(write_string(self.path))
+        b.extend(struct.pack('!I', self.max_entries))
+        return b
+
+    @classmethod
+    def deserialize(cls, bytes, offset):
+        count = int_struct.unpack_from(bytes, offset)[0]
+        offset += int_struct.size
+        children = []
+        for c in range(count):
+            child, offset = read_string(bytes, offset)
+            children.append(child)
+        return children
+
+
 class KeeperFeatureClient(KazooClient):
     """A Zookeeper Python client extends from Kazoo.KazooClient,
     Kazoo is a Python library working with Zookeeper.
@@ -238,6 +286,34 @@ class KeeperFeatureClient(KazooClient):
 
         """
         return MultiReadRequest(self)
+
+    def remove_recursive(self, path, remove_nodes_limit=0):
+        """Remove a node and all its descendants atomically.
+
+        :returns: True on success.
+        :raises NoNodeError: if the node doesn't exist.
+        """
+        async_result = self.handler.async_result()
+        self._call(RemoveRecursive(_prefix_root(self.chroot, path), remove_nodes_limit), async_result)
+        return async_result.get()
+
+    def try_remove(self, path, version=-1):
+        """Remove a node if it exists. No error if the node is absent.
+
+        :returns: True on success.
+        """
+        async_result = self.handler.async_result()
+        self._call(TryRemove(_prefix_root(self.chroot, path), version), async_result)
+        return async_result.get()
+
+    def list_recursive(self, path, max_entries=0):
+        """List all descendants of a node recursively.
+
+        :returns: List of full paths under the given node.
+        """
+        async_result = self.handler.async_result()
+        self._call(ListRecursive(_prefix_root(self.chroot, path), max_entries), async_result)
+        return async_result.get()
 
     def get_filtered_children(self, path, watch=None, list_type=None, include_data=False):
         """Get a list of child nodes of a path.
@@ -614,6 +690,7 @@ class TransactionRequestExt(TransactionRequest):
 
         self._add(CreateIfNotExists(_prefix_root(self.client.chroot, path), value, acl,
                                     flags), None)
+
 
 class MultiRead(namedtuple('MultiRead', 'operations')):
     type = 22

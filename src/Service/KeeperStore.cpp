@@ -493,7 +493,10 @@ struct StoreRequestRemove final : public StoreRequest
         auto node = store.getNode(request.path);
         if (node == nullptr)
         {
-            response.error = Coordination::Error::ZNONODE;
+            if (request.try_remove)
+                response.error = Coordination::Error::ZOK;
+            else
+                response.error = Coordination::Error::ZNONODE;
         }
         else if (request.version != -1 && request.version != node->stat.version)
         {
@@ -547,6 +550,168 @@ struct StoreRequestRemove final : public StoreRequest
         }
 
         return {response_ptr, undo};
+    }
+};
+
+struct StoreRequestRemoveRecursive final : public StoreRequest
+{
+    using StoreRequest::StoreRequest;
+
+    bool checkAuth(KeeperStore & store, int64_t session_id) const override
+    {
+        auto parent = store.getNode(getParentPath(zk_request->getPath()));
+        if (parent == nullptr)
+            return true;
+
+        const auto & node_acls = store.acl_map.convertNumber(parent->acl_id);
+        if (node_acls.empty())
+            return true;
+
+        std::shared_lock r_lock(store.auth_mutex);
+        auto it = store.session_and_auth.find(session_id);
+        const auto & session_auths = (it != store.session_and_auth.end()) ? it->second : std::vector<Coordination::AuthID>{};
+        return checkACL(Coordination::ACL::Delete, node_acls, session_auths);
+    }
+
+    std::pair<Coordination::ZooKeeperResponsePtr, Undo>
+    process(KeeperStore & store, int64_t /*zxid*/, int64_t /*session_id*/, int64_t /* time */) const override
+    {
+        auto response = zk_request->makeResponse();
+        auto & request_typed = dynamic_cast<Coordination::ZooKeeperRemoveRecursiveRequest &>(*zk_request);
+        auto & response_typed = dynamic_cast<Coordination::ZooKeeperRemoveRecursiveResponse &>(*response);
+
+        auto root_node = store.getNode(request_typed.path);
+        if (root_node == nullptr)
+        {
+            response_typed.error = Coordination::Error::ZNONODE;
+            return {response, {}};
+        }
+
+        /// Collect all descendant paths via DFS
+        std::vector<String> paths_to_remove;
+        paths_to_remove.push_back(request_typed.path);
+        std::function<void(const KeeperNodePtr &, const String &)> collect_descendants
+            = [&](const KeeperNodePtr & node, const String & node_path)
+        {
+            for (const auto & child : node->children)
+            {
+                String child_path = node_path + "/" + child;
+                auto child_node = store.getNode(child_path);
+                if (child_node)
+                {
+                    paths_to_remove.push_back(child_path);
+                    if (!child_node->children.empty())
+                        collect_descendants(child_node, child_path);
+                }
+            }
+        };
+        collect_descendants(root_node, request_typed.path);
+
+        /// Check limit
+        if (request_typed.remove_nodes_limit > 0
+            && paths_to_remove.size() > static_cast<size_t>(request_typed.remove_nodes_limit))
+        {
+            response_typed.error = Coordination::Error::ZNOTEMPTY;
+            return {response, {}};
+        }
+
+        /// Remove from leaves up. Each node is removed individually via KeeperStore public API.
+        for (auto it = paths_to_remove.rbegin(); it != paths_to_remove.rend(); ++it)
+        {
+            const auto & path = *it;
+            auto node = store.getNode(path);
+            if (!node)
+                continue;
+
+            /// Clear from parent's children set
+            auto parent = store.getNode(getParentPath(path));
+            if (parent)
+                parent->children.erase(getBaseName(path));
+
+            /// Clean ephemeral and ACL references
+            if (node->is_ephemeral)
+                store.removeEphemeralNode(node->stat.ephemeralOwner, path);
+            store.acl_map.removeUsage(node->acl_id);
+            store.removeNode(path);
+        }
+
+        response_typed.error = Coordination::Error::ZOK;
+        return {response, {}};
+    }
+};
+
+struct StoreRequestListRecursive final : public StoreRequest
+{
+    using StoreRequest::StoreRequest;
+
+    bool checkAuth(KeeperStore & store, int64_t session_id) const override
+    {
+        return checkACLForNode(store, session_id, zk_request->getPath(), Coordination::ACL::Read);
+    }
+
+    std::pair<Coordination::ZooKeeperResponsePtr, Undo>
+    process(KeeperStore & store, int64_t /*zxid*/, int64_t /*session_id*/, int64_t /* time */) const override
+    {
+        auto response = zk_request->makeResponse();
+        auto & response_typed = dynamic_cast<Coordination::ZooKeeperListRecursiveResponse &>(*response);
+
+        /// ponytail: access path directly from the request, same as other StoreRequest implementations
+        auto & request_typed = dynamic_cast<Coordination::ZooKeeperListRecursiveRequest &>(*zk_request);
+
+        auto node = store.getNode(request_typed.path);
+        if (!node)
+        {
+            response_typed.error = Coordination::Error::ZNONODE;
+            return {response, {}};
+        }
+
+        std::vector<String> all_paths;
+        bool stopped = false;
+
+        std::function<void(const KeeperNodePtr &, const String &)> collect_recursive
+            = [&](const KeeperNodePtr & current, const String & current_path)
+        {
+            for (const auto & child : current->children)
+            {
+                if (stopped)
+                    return;
+
+                String child_path = current_path + "/" + child;
+                all_paths.push_back(child_path);
+
+                if (request_typed.max_entries > 0
+                    && all_paths.size() >= static_cast<size_t>(request_typed.max_entries))
+                {
+                    stopped = true;
+                    return;
+                }
+
+                auto child_node = store.getNode(child_path);
+                if (child_node && !child_node->children.empty())
+                    collect_recursive(child_node, child_path);
+            }
+        };
+
+        collect_recursive(node, request_typed.path);
+
+        response_typed.names.push_back(all_paths.begin(), all_paths.end());
+        response_typed.error = Coordination::Error::ZOK;
+        return {response, {}};
+    }
+
+private:
+    static bool checkACLForNode(KeeperStore & store, int64_t session_id, const String & path, int32_t permission)
+    {
+        auto node = store.getNode(path);
+        if (!node)
+            return true;
+        const auto & node_acls = store.acl_map.convertNumber(node->acl_id);
+        if (node_acls.empty())
+            return true;
+        std::shared_lock r_lock(store.auth_mutex);
+        auto it = store.session_and_auth.find(session_id);
+        const auto & session_auths = (it != store.session_and_auth.end()) ? it->second : std::vector<Coordination::AuthID>{};
+        return checkACL(permission, node_acls, session_auths);
     }
 };
 
@@ -813,6 +978,48 @@ struct StoreRequestCheck final : public StoreRequest
 
 private:
     bool check_not_exists;
+};
+
+struct StoreRequestCheckStat final : public StoreRequest
+{
+    using StoreRequest::StoreRequest;
+
+    bool checkAuth(KeeperStore & store, int64_t session_id) const override
+    {
+        auto node = store.getNode(zk_request->getPath());
+        if (node == nullptr)
+            return true;
+
+        const auto & node_acls = store.acl_map.convertNumber(node->acl_id);
+        if (node_acls.empty())
+            return true;
+
+        std::shared_lock r_lock(store.auth_mutex);
+        auto it = store.session_and_auth.find(session_id);
+        const auto & session_auths = (it != store.session_and_auth.end()) ? it->second : std::vector<Coordination::AuthID>{};
+        return checkACL(Coordination::ACL::Read, node_acls, session_auths);
+    }
+
+    std::pair<Coordination::ZooKeeperResponsePtr, Undo>
+    process(KeeperStore & store, int64_t /*zxid*/, int64_t /*session_id*/, int64_t /* time */) const override
+    {
+        auto response = zk_request->makeResponse();
+        auto & request_typed = dynamic_cast<Coordination::ZooKeeperCheckStatRequest &>(*zk_request);
+
+        auto node = store.getNode(request_typed.path);
+        if (node == nullptr)
+            response->error = Coordination::Error::ZNONODE;
+        else if (request_typed.version != -1 && request_typed.version != node->stat.version)
+            response->error = Coordination::Error::ZBADVERSION;
+        else if (request_typed.cversion != -1 && request_typed.cversion != node->stat.cversion)
+            response->error = Coordination::Error::ZBADVERSION;
+        else if (request_typed.aversion != -1 && request_typed.aversion != node->stat.aversion)
+            response->error = Coordination::Error::ZBADVERSION;
+        else
+            response->error = Coordination::Error::ZOK;
+
+        return {response, {}};
+    }
 };
 
 struct StoreRequestSetACL final : public StoreRequest
@@ -1221,6 +1428,11 @@ StoreRequestFactory::StoreRequestFactory()
     registerNuKeeperRequestWrapper<Coordination::OpNum::GetACL, StoreRequestGetACL>(*this);
     registerNuKeeperRequestWrapper<Coordination::OpNum::CheckNotExists, StoreRequestCheck>(*this);
     registerNuKeeperRequestWrapper<Coordination::OpNum::CreateIfNotExists, StoreRequestCreate>(*this);
+    registerNuKeeperRequestWrapper<Coordination::OpNum::RemoveRecursive, StoreRequestRemoveRecursive>(*this);
+    registerNuKeeperRequestWrapper<Coordination::OpNum::CheckStat, StoreRequestCheckStat>(*this);
+    registerNuKeeperRequestWrapper<Coordination::OpNum::TryRemove, StoreRequestRemove>(*this);
+    registerNuKeeperRequestWrapper<Coordination::OpNum::FilteredListWithStatsAndData, StoreRequestList>(*this);
+    registerNuKeeperRequestWrapper<Coordination::OpNum::ListRecursive, StoreRequestListRecursive>(*this);
 }
 
 
