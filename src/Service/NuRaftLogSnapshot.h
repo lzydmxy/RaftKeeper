@@ -135,7 +135,7 @@ public:
         snapshot & meta,
         UInt32 max_object_node_size_ = MAX_OBJECT_NODE_SIZE,
         UInt32 save_batch_size_ = SAVE_BATCH_SIZE,
-        SnapshotVersion version_ = CURRENT_SNAPSHOT_VERSION)
+        SnapshotVersion version_ = SnapshotVersion::V2)
         : version(version_)
         , snap_dir(snap_dir_)
         , max_object_node_size(max_object_node_size_)
@@ -317,14 +317,14 @@ public:
 
     size_t createSnapshotAsync(
         SnapTask & snap_task,
-        SnapshotVersion version = CURRENT_SNAPSHOT_VERSION);
+        SnapshotVersion version = SnapshotVersion::V2);
 
     size_t createSnapshot(
         snapshot & meta,
         KeeperStore & store,
         int64_t next_zxid = 0,
         int64_t next_session_id = 0,
-        SnapshotVersion version = CURRENT_SNAPSHOT_VERSION);
+        SnapshotVersion version = SnapshotVersion::V2);
 
     /// save snapshot meta, invoked when we receive an snapshot from leader.
     bool receiveSnapshotMeta(snapshot & meta);

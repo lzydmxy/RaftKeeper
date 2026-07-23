@@ -36,6 +36,7 @@ enum class SnapshotVersion : uint8_t
     V0 = 0,
     V1 = 1, /// Add ACL map
     V2 = 2, /// Replace protobuf
+    V3 = 3, /// zstd-compressed batch bodies
 
     UNKNOWN = 255,
 };
@@ -43,12 +44,13 @@ enum class SnapshotVersion : uint8_t
 String toString(SnapshotVersion version);
 
 
-static constexpr auto CURRENT_SNAPSHOT_VERSION = SnapshotVersion::V2;
+/// Maximum snapshot version we can read (write default is V2 for rolling-upgrade safety).
+static constexpr auto MAX_SNAPSHOT_VERSION = SnapshotVersion::V3;
 
 /// Batch data header in a snapshot object file.
 struct SnapshotBatchHeader
 {
-    /// The length of the batch data (uncompressed)
+    /// The length of the batch data on disk (compressed if V3+, raw otherwise)
     UInt32 data_length;
     /// The CRC32C of the batch data.
     /// If compression is enabled, this is the checksum of the compressed data.
@@ -107,9 +109,9 @@ ptr<KeeperNodeWithPath> parseKeeperNode(const String & buf, SnapshotVersion vers
 
 
 /// save batch data in snapshot object
-std::pair<size_t, UInt32> saveBatchV2(ptr<WriteBufferFromFile> & out, ptr<SnapshotBatchBody> & batch);
+std::pair<size_t, UInt32> saveBatchV2(ptr<WriteBufferFromFile> & out, ptr<SnapshotBatchBody> & batch, SnapshotVersion version);
 std::pair<size_t, UInt32>
-saveBatchAndUpdateCheckSumV2(ptr<WriteBufferFromFile> & out, ptr<SnapshotBatchBody> & batch, UInt32 checksum);
+saveBatchAndUpdateCheckSumV2(ptr<WriteBufferFromFile> & out, ptr<SnapshotBatchBody> & batch, UInt32 checksum, SnapshotVersion version);
 
 void serializeAclsV2(const NumToACLMap & acls, String path, UInt32 save_batch_size, SnapshotVersion version);
 

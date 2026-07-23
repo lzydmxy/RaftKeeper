@@ -18,6 +18,7 @@
 #include <Service/NuRaftLogSnapshot.h>
 #include <Service/ReadBufferFromNuRaftBuffer.h>
 #include <Service/WriteBufferFromNuraftBuffer.h>
+#include <Service/ZstdLogCodec.h>
 #include <ZooKeeper/ZooKeeperIO.h>
 
 
@@ -58,7 +59,7 @@ size_t KeeperSnapshotStore::serializeDataTreeV2(KeeperStore & storage)
     uint32_t checksum = 0;
 
     serializeNodeV2(out, batch, storage, "/", processed, checksum);
-    auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum);
+    auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum, version);
     checksum = new_checksum;
 
     writeTailAndClose(out, checksum);
@@ -73,7 +74,7 @@ size_t KeeperSnapshotStore::serializeDataTreeAsync(SnapTask & snap_task) const
     ptr<SnapshotBatchBody> batch;
 
     auto checksum = serializeNodeAsync(out, batch, *snap_task.buckets_nodes);
-    auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum);
+    auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum, version);
     checksum = new_checksum;
 
     writeTailAndClose(out, checksum);
@@ -106,7 +107,7 @@ void KeeperSnapshotStore::serializeNodeV2(
         if (obj_id != 0)
         {
             /// flush last batch data
-            auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum);
+            auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum, version);
             checksum = new_checksum;
 
             /// close current object file
@@ -129,7 +130,7 @@ void KeeperSnapshotStore::serializeNodeV2(
         if (processed != 0)
         {
             /// flush data in batch to file
-            auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum);
+            auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum, version);
             checksum = new_checksum;
         }
         else
@@ -170,7 +171,7 @@ uint32_t KeeperSnapshotStore::serializeNodeAsync(
                 if (obj_id != 0)
                 {
                     /// flush last batch data
-                    auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum);
+                    auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum, version);
                     checksum = new_checksum;
 
                     /// close current object file
@@ -193,7 +194,7 @@ uint32_t KeeperSnapshotStore::serializeNodeAsync(
                 if (processed != 0)
                 {
                     /// flush data in batch to file
-                    auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum);
+                    auto [save_size, new_checksum] = saveBatchAndUpdateCheckSumV2(out, batch, checksum, version);
                     checksum = new_checksum;
                 }
                 else
@@ -470,7 +471,7 @@ void KeeperSnapshotStore::parseObject(KeeperStore & store, String obj_path, Buck
             snap_fs->read(buf, sizeof(uint8_t));
             read_size += 1;
             LOG_DEBUG(log, "Got snapshot file header with version {}", toString(version_from_obj));
-            if (version_from_obj > CURRENT_SNAPSHOT_VERSION)
+            if (version_from_obj > MAX_SNAPSHOT_VERSION)
                 throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION, "Unsupported snapshot version {}", toString(version_from_obj));
         }
         else if (isSnapshotFileTail(magic))
@@ -515,6 +516,20 @@ void KeeperSnapshotStore::parseObject(KeeperStore & store, String obj_path, Buck
         if (!verifyCRC32(body_buf, header.data_length, header.data_crc))
         {
             throwFromErrno("Can't read snapshot object file " + obj_path + ", batch crc not match.", ErrorCodes::CORRUPTED_SNAPSHOT);
+        }
+
+        if (version_from_obj >= SnapshotVersion::V3)
+        {
+            try
+            {
+                auto decompressed = ZstdLogCodec::decompress(body_string.data(), body_string.size());
+                body_string.assign(reinterpret_cast<const char *>(decompressed->data_begin()), decompressed->size());
+            }
+            catch (Exception & e)
+            {
+                e.addMessage("Can't decompress snapshot object " + obj_path);
+                throw;
+            }
         }
 
         parseBatchBodyV2(store, body_string, buckets_edges, bucket_nodes, version_from_obj);
