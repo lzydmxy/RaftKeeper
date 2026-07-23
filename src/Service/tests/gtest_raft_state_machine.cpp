@@ -299,3 +299,180 @@ TEST(RaftStateMachine, initStateMachine)
     cleanDirectory(snap_dir);
     cleanDirectory(log_dir);
 }
+
+TEST(RaftStateMachine, MultiReadDoesNotIncreaseZxid)
+{
+    String snap_dir(SNAP_DIR + "/multiread_zxid");
+    String log_dir(LOG_DIR + "/multiread_zxid");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+
+    /// Set up: create a session and a test node
+    int64_t session_id = machine.getStore().getSessionID(30000);
+    setNode(machine.getStore(), "test_node", "test_data", /*is_ephemeral=*/false, session_id);
+
+    /// Record zxid before MultiRead
+    int64_t zxid_before = machine.getStore().getZxid();
+
+    /// Build MultiRead request
+    auto multi_read = cs_new<ZooKeeperMultiRequest>();
+    multi_read->operation_type = ZooKeeperMultiRequest::OperationType::Read;
+    multi_read->xid = 100;
+
+    for (int i = 0; i < 5; ++i)
+    {
+        auto get_req = cs_new<ZooKeeperGetRequest>();
+        get_req->path = "/test_node";
+        get_req->xid = 100;
+        multi_read->requests.push_back(get_req);
+    }
+
+    /// Process
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(
+        response_queue, {multi_read, session_id, time}, {}, /*check_acl=*/true, /*ignore_response=*/false);
+
+    /// Verify zxid didn't change
+    ASSERT_EQ(machine.getStore().getZxid(), zxid_before);
+
+    /// Verify response
+    ResponseForSession response_for_session;
+    ASSERT_TRUE(response_queue.tryPop(response_for_session));
+    ASSERT_EQ(response_for_session.response->getOpNum(), OpNum::MultiRead);
+    auto & multi_response = dynamic_cast<ZooKeeperMultiResponse &>(*response_for_session.response);
+    ASSERT_EQ(multi_response.responses.size(), 5u);
+    for (size_t i = 0; i < 5; ++i)
+        ASSERT_EQ(multi_response.responses[i]->error, Error::ZOK);
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, MultiReadRegistersSubrequestWatches)
+{
+    String snap_dir(SNAP_DIR + "/multiread_watch");
+    String log_dir(LOG_DIR + "/multiread_watch");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+
+    int64_t session_id = machine.getStore().getSessionID(30000);
+    setNode(machine.getStore(), "test_node_a", "data_a", /*is_ephemeral=*/false, session_id);
+    setNode(machine.getStore(), "test_node_b", "data_b", /*is_ephemeral=*/false, session_id);
+
+    /// Count watches before
+    uint64_t watches_before = machine.getStore().getTotalWatchesCount();
+
+    /// Build MultiRead with watched subrequests on different paths
+    auto multi_read = cs_new<ZooKeeperMultiRequest>();
+    multi_read->operation_type = ZooKeeperMultiRequest::OperationType::Read;
+    multi_read->xid = 200;
+
+    /// Get with watch on path A
+    {
+        auto req = cs_new<ZooKeeperGetRequest>();
+        req->path = "/test_node_a";
+        req->has_watch = true;
+        req->xid = 200;
+        multi_read->requests.push_back(req);
+    }
+    /// Exists with watch on path B
+    {
+        auto req = cs_new<ZooKeeperExistsRequest>();
+        req->path = "/test_node_b";
+        req->has_watch = true;
+        req->xid = 200;
+        multi_read->requests.push_back(req);
+    }
+
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(
+        response_queue, {multi_read, session_id, time}, {}, /*check_acl=*/true, /*ignore_response=*/false);
+
+    /// Both subrequests registered watches
+    ASSERT_EQ(machine.getStore().getTotalWatchesCount(), watches_before + 2);
+
+    /// Verify response
+    ResponseForSession response_for_session;
+    ASSERT_TRUE(response_queue.tryPop(response_for_session));
+    auto & multi_response = dynamic_cast<ZooKeeperMultiResponse &>(*response_for_session.response);
+    ASSERT_EQ(multi_response.responses.size(), 2u);
+    ASSERT_EQ(multi_response.responses[0]->error, Error::ZOK);
+    ASSERT_EQ(multi_response.responses[1]->error, Error::ZOK);
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, MultiReadHandlesIndividualErrors)
+{
+    String snap_dir(SNAP_DIR + "/multiread_error");
+    String log_dir(LOG_DIR + "/multiread_error");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+
+    int64_t session_id = machine.getStore().getSessionID(30000);
+    setNode(machine.getStore(), "test_node", "test_data", /*is_ephemeral=*/false, session_id);
+
+    /// Build MultiRead: one valid path, one nonexistent path
+    auto multi_read = cs_new<ZooKeeperMultiRequest>();
+    multi_read->operation_type = ZooKeeperMultiRequest::OperationType::Read;
+    multi_read->xid = 300;
+
+    {
+        auto req = cs_new<ZooKeeperGetRequest>();
+        req->path = "/test_node";
+        req->xid = 300;
+        multi_read->requests.push_back(req);
+    }
+    {
+        auto req = cs_new<ZooKeeperGetRequest>();
+        req->path = "/nonexistent_path";
+        req->xid = 300;
+        multi_read->requests.push_back(req);
+    }
+
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(
+        response_queue, {multi_read, session_id, time}, {}, /*check_acl=*/true, /*ignore_response=*/false);
+
+    /// Each subrequest has its own error — first succeeds, second fails with ZNONODE
+    ResponseForSession response_for_session;
+    ASSERT_TRUE(response_queue.tryPop(response_for_session));
+    auto & multi_response = dynamic_cast<ZooKeeperMultiResponse &>(*response_for_session.response);
+    ASSERT_EQ(multi_response.responses.size(), 2u);
+    ASSERT_EQ(multi_response.responses[0]->error, Error::ZOK);
+    ASSERT_EQ(multi_response.responses[1]->error, Error::ZNONODE);
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
