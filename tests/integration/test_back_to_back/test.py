@@ -879,14 +879,14 @@ def test_unregister_watch(started_cluster):
         close_zk_clients([genuine_zk, fake_zk])
 
 
-def get_zxid_from_mntr(node):
-    """Extract Zxid from node's mntr output."""
-    data = node.send_4lw_cmd(cmd='mntr')
-    reader = csv.reader(data.split('\n'), delimiter='\t')
+def get_zxid_from_srvr(node):
+    """Extract Zxid from node's srvr output (format: 'Key: value')."""
+    data = node.send_4lw_cmd(cmd='srvr')
+    reader = csv.reader(data.split('\n'), delimiter=':')
     for row in reader:
-        if len(row) == 2 and row[0] == 'Zxid':
-            return int(row[1])
-    raise Exception("Zxid not found in mntr output")
+        if len(row) >= 2 and row[0].strip() == 'Zxid':
+            return int(row[1].strip())
+    raise Exception("Zxid not found in srvr output")
 
 
 def test_multi_read_zxid_stability(started_cluster):
@@ -899,7 +899,7 @@ def test_multi_read_zxid_stability(started_cluster):
         fake_zk.create('/test_multiread_zxid/a', b'data_a')
         fake_zk.create('/test_multiread_zxid/b', b'data_b')
 
-        zxid_before = get_zxid_from_mntr(node1)
+        zxid_before = get_zxid_from_srvr(node1)
 
         t = fake_zk.multi_read()
         t.get('/test_multiread_zxid/a', None)
@@ -911,7 +911,7 @@ def test_multi_read_zxid_stability(started_cluster):
         assert results[1][0] == b'data_b'
         assert sorted(results[2][0]) == ['a', 'b']
 
-        zxid_after = get_zxid_from_mntr(node1)
+        zxid_after = get_zxid_from_srvr(node1)
         assert zxid_after == zxid_before, \
             f"MultiRead incorrectly advanced zxid from {zxid_before} to {zxid_after}"
 
