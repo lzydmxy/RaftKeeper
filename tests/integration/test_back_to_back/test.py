@@ -909,7 +909,7 @@ def test_multi_read_zxid_stability(started_cluster):
         assert len(results) == 3
         assert results[0][0] == b'data_a'
         assert results[1][0] == b'data_b'
-        assert sorted(results[2][0]) == ['a', 'b']
+        assert sorted(results[2]) == ['a', 'b']
 
         zxid_after = get_zxid_from_srvr(node1)
         assert zxid_after == zxid_before, \
