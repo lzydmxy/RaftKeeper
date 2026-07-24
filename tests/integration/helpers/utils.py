@@ -1,4 +1,4 @@
-from kazoo.client import KazooClient, Create, GetData, GetChildren, OPEN_ACL_UNSAFE, \
+from kazoo.client import KazooClient, Create, GetData, GetChildren, Exists, OPEN_ACL_UNSAFE, \
     GetChildren2, Exists, TransactionRequest, Create2
 from kazoo.protocol.paths import _prefix_root
 from kazoo.protocol.serialization import MultiHeader, Transaction, multiheader_struct, int_struct, read_string, \
@@ -133,6 +133,12 @@ class MultiReadRequest(object):
         :returns: None
         """
         self._add(GetChildren(path, watcher), None)
+
+    def exists(self, path, watcher):
+        """Add an exists ZNode ops to the operations.
+        :returns: None
+        """
+        self._add(Exists(path, watcher), None)
 
     def get_children3(self, path, list_type, watcher):
         """Add a filteredList ops to the operations.

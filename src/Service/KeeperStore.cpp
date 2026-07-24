@@ -119,7 +119,8 @@ static bool shouldIncreaseZxid(const Coordination::ZooKeeperRequestPtr & zk_requ
         || dynamic_cast<Coordination::ZooKeeperAuthRequest *>(zk_request.get())
         || dynamic_cast<Coordination::ZooKeeperHeartbeatRequest *>(zk_request.get())
         || dynamic_cast<Coordination::ZooKeeperListRequest *>(zk_request.get())
-        || dynamic_cast<Coordination::ZooKeeperSimpleListRequest *>(zk_request.get()));
+        || dynamic_cast<Coordination::ZooKeeperSimpleListRequest *>(zk_request.get())
+        || zk_request->getOpNum() == Coordination::OpNum::MultiRead);
 }
 
 KeeperNodePtr KeeperNode::clone() const
@@ -1348,6 +1349,62 @@ void KeeperStore::processRequest(
         set_response(responses_queue, watch_responses, ignore_response);
 
         /// no response for SetWatches request
+        set_response(responses_queue, ResponseForSession{session_id, response}, ignore_response);
+    }
+    else if (zk_request->getOpNum() == Coordination::OpNum::MultiRead)
+    {
+        auto & multi_request = dynamic_cast<Coordination::ZooKeeperMultiRequest &>(*zk_request);
+        auto response = zk_request->makeResponse();
+        auto & multi_response = dynamic_cast<Coordination::ZooKeeperMultiResponse &>(*response);
+
+        for (size_t i = 0; i < multi_request.requests.size(); ++i)
+        {
+            auto sub_zk_request = std::dynamic_pointer_cast<Coordination::ZooKeeperRequest>(multi_request.requests[i]);
+            auto sub_opnum = sub_zk_request->getOpNum();
+
+            /// MultiRead only allows read operations. Writes routed here would bypass Raft consensus.
+            if (sub_opnum != Coordination::OpNum::Get
+                && sub_opnum != Coordination::OpNum::Exists
+                && sub_opnum != Coordination::OpNum::List
+                && sub_opnum != Coordination::OpNum::SimpleList
+                && sub_opnum != Coordination::OpNum::FilteredList
+                && sub_opnum != Coordination::OpNum::GetACL)
+            {
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Illegal command {} as part of MultiRead request",
+                    Coordination::toString(sub_opnum));
+            }
+
+            auto sub_store_request = StoreRequestFactory::instance().get(sub_zk_request);
+            Coordination::ZooKeeperResponsePtr sub_response;
+
+            if (check_acl && !sub_store_request->checkAuth(*this, session_id))
+            {
+                sub_response = sub_zk_request->makeResponse();
+                sub_response->error = Coordination::Error::ZNOAUTH;
+            }
+            else
+            {
+                sub_response = sub_store_request->process(*this, zxid, session_id, request_for_session.process_time).first;
+            }
+
+            sub_response->xid = sub_zk_request->xid;
+            sub_response->zxid = zxid.load();
+
+            if (sub_zk_request->has_watch && (sub_response->error == Coordination::Error::ZOK
+                || (sub_response->error == Coordination::Error::ZNONODE && sub_zk_request->getOpNum() == Coordination::OpNum::Exists)))
+            {
+                watch_manager.registerWatches(sub_zk_request->getPath(), session_id, sub_zk_request->getOpNum());
+            }
+
+            multi_response.responses[i] = sub_response;
+        }
+
+        response->request_created_time_ms = request_for_session.create_time;
+        response->xid = zk_request->xid;
+        response->zxid = zxid.load(); /// ponytail: MultiRead is always processed locally, never gets new_last_zxid
+
         set_response(responses_queue, ResponseForSession{session_id, response}, ignore_response);
     }
     else

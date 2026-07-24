@@ -4,6 +4,7 @@ import random
 import string
 import os
 import time
+import csv
 from multiprocessing.dummy import Pool
 from kazoo.client import KazooClient, KazooState
 from helpers.cluster_service import RaftKeeperCluster
@@ -873,6 +874,77 @@ def test_unregister_watch(started_cluster):
             print(f"Data {index}: {data}")
             
         for data0, data1 in zip(datas[0], datas[1]):
-            assert len(data0[0].splitlines()) == len(data1[1].splitlines())  
+            assert len(data0[0].splitlines()) == len(data1[1].splitlines())
     finally:
         close_zk_clients([genuine_zk, fake_zk])
+
+
+def get_zxid_from_srvr(node):
+    """Extract Zxid from node's srvr output (format: 'Key: value')."""
+    data = node.send_4lw_cmd(cmd='srvr')
+    reader = csv.reader(data.split('\n'), delimiter=':')
+    for row in reader:
+        if len(row) >= 2 and row[0].strip() == 'Zxid':
+            return int(row[1].strip())
+    raise Exception("Zxid not found in srvr output")
+
+
+def test_multi_read_zxid_stability(started_cluster):
+    fake_zk = None
+    try:
+        fake_zk = get_fake_zk(True)
+        fake_zk.start()
+
+        fake_zk.create('/test_multiread_zxid')
+        fake_zk.create('/test_multiread_zxid/a', b'data_a')
+        fake_zk.create('/test_multiread_zxid/b', b'data_b')
+
+        zxid_before = get_zxid_from_srvr(node1)
+
+        t = fake_zk.multi_read()
+        t.get('/test_multiread_zxid/a', None)
+        t.get('/test_multiread_zxid/b', None)
+        t.get_children('/test_multiread_zxid', None)
+        results = t.commit()
+        assert len(results) == 3
+        assert results[0][0] == b'data_a'
+        assert results[1][0] == b'data_b'
+        assert sorted(results[2]) == ['a', 'b']
+
+        zxid_after = get_zxid_from_srvr(node1)
+        assert zxid_after == zxid_before, \
+            f"MultiRead incorrectly advanced zxid from {zxid_before} to {zxid_after}"
+
+    finally:
+        close_zk_clients([fake_zk])
+
+
+def test_multi_read_subrequest_watch(started_cluster):
+    """Verify MultiRead subrequests with watch=true register watches server-side."""
+    fake_zk = None
+    try:
+        fake_zk = get_fake_zk(True)
+        fake_zk.start()
+
+        fake_zk.create('/test_multiread_watch')
+        fake_zk.create('/test_multiread_watch/node_a', b'data_a')
+        fake_zk.create('/test_multiread_watch/node_b', b'data_b')
+
+        t = fake_zk.multi_read()
+        t.get('/test_multiread_watch/node_a', lambda e: None)
+        t.exists('/test_multiread_watch/node_b', lambda e: None)
+        results = t.commit()
+        assert len(results) == 2
+        assert results[0][0] == b'data_a'
+        assert results[1] is not None
+
+        # Verify watches were registered server-side via wchc (watch by session) 4LW
+        # Format: <session_id_hex>\n\t<path>\n\t<path>\n...
+        wchc_output = node1.send_4lw_cmd(cmd='wchc')
+        assert '/test_multiread_watch/node_a' in wchc_output, \
+            "Get watch from MultiRead subrequest not registered on server"
+        assert '/test_multiread_watch/node_b' in wchc_output, \
+            "Exists watch from MultiRead subrequest not registered on server"
+
+    finally:
+        close_zk_clients([fake_zk])
