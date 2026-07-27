@@ -159,6 +159,21 @@ def get_snapshots(node):
     return snapshots
 
 
+def wait_for_snapshots(node, expected_count, timeout=30):
+    # ponytail: poll instead of a fixed sleep(1) — under sanitizers the snapshot dir
+    # may not exist yet right after csnp, which made get_snapshots' ls fail intermittently.
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            snapshots = get_snapshots(node)
+            if len(snapshots) == expected_count:
+                return snapshots
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return get_snapshots(node)
+
+
 @pytest.mark.parametrize(
     'node',
     [
@@ -175,8 +190,7 @@ def test_snapshot_clear(started_cluster, node):
             node_zk.create(f"/test_node_clear_{i}", b"test")
             node.send_4lw_cmd(cmd="csnp")
             # wait for snapshot to be taken
-            time.sleep(1)
-            snapshots = get_snapshots(node)
+            snapshots = wait_for_snapshots(node, 1)
             assert (len(snapshots) == 1)
     finally:
         close_zk_clients([node_zk, node_zk2])

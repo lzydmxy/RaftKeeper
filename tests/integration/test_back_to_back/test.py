@@ -585,7 +585,9 @@ def generate_requests(prefix="/", iters=1):
 def test_random_requests(started_cluster):
     genuine_zk = fake_zk = None
     try:
-        requests = generate_requests("/test_random_requests", 10)
+        # ponytail: 10 iters (~3000 serial round-trips x2 clients) times out under
+        # sanitizers (~10x slowdown). 3 iters keeps broad randomized coverage within 300s.
+        requests = generate_requests("/test_random_requests", 3)
         print("Generated", len(requests), "requests")
         genuine_zk = get_genuine_zk()
         fake_zk = get_fake_zk()

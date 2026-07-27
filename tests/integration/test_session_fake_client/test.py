@@ -218,7 +218,7 @@ def test_invalid_timeout_setting(started_cluster):
     node1.stop_raftkeeper()
     time.sleep(3)
     node1.replace_in_config('/etc/raftkeeper-server/config.d/enable_keeper1.xml', '12000', '200')
-    node1.start_raftkeeper()
+    node1.start_raftkeeper(start_wait=True)
 
     data = send_4lw_cmd(node1.name, cmd='conf')
     reader = csv.reader(data.split('\n'), delimiter='=')
