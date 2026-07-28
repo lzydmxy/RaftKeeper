@@ -120,7 +120,8 @@ static bool shouldIncreaseZxid(const Coordination::ZooKeeperRequestPtr & zk_requ
         || dynamic_cast<Coordination::ZooKeeperHeartbeatRequest *>(zk_request.get())
         || dynamic_cast<Coordination::ZooKeeperListRequest *>(zk_request.get())
         || dynamic_cast<Coordination::ZooKeeperSimpleListRequest *>(zk_request.get())
-        || zk_request->getOpNum() == Coordination::OpNum::MultiRead);
+        || zk_request->getOpNum() == Coordination::OpNum::MultiRead
+        || zk_request->getOpNum() == Coordination::OpNum::ListRecursive);
 }
 
 KeeperNodePtr KeeperNode::clone() const
@@ -574,7 +575,7 @@ struct StoreRequestRemoveRecursive final : public StoreRequest
     }
 
     std::pair<Coordination::ZooKeeperResponsePtr, Undo>
-    process(KeeperStore & store, int64_t /*zxid*/, int64_t /*session_id*/, int64_t /* time */) const override
+    process(KeeperStore & store, int64_t zxid, int64_t /*session_id*/, int64_t /* time */) const override
     {
         auto response = zk_request->makeResponse();
         auto & request_typed = dynamic_cast<Coordination::ZooKeeperRemoveRecursiveRequest &>(*zk_request);
@@ -613,6 +614,15 @@ struct StoreRequestRemoveRecursive final : public StoreRequest
         {
             response_typed.error = Coordination::Error::ZNOTEMPTY;
             return {response, {}};
+        }
+
+        /// Update the surviving parent of the recursive-delete root: its child count
+        /// drops by one and pzxid advances, matching StoreRequestRemove's behaviour.
+        /// (Descendants' parents are themselves removed, so only this parent survives.)
+        if (auto root_parent = store.getNode(getParentPath(request_typed.path)))
+        {
+            --root_parent->stat.numChildren;
+            root_parent->stat.pzxid = zxid;
         }
 
         /// Remove from leaves up. Each node is removed individually via KeeperStore public API.
@@ -855,30 +865,33 @@ struct StoreRequestList final : public StoreRequest
         if (path_prefix.empty())
             throw RK::Exception(ErrorCodes::LOGICAL_ERROR, "Logical error: path cannot be empty");
 
-        if (response->getOpNum() == Coordination::OpNum::List || response->getOpNum() == Coordination::OpNum::FilteredList)
+        if (response->getOpNum() == Coordination::OpNum::List
+            || response->getOpNum() == Coordination::OpNum::FilteredList
+            || response->getOpNum() == Coordination::OpNum::FilteredListWithStatsAndData)
         {
             using enum Coordination::ZooKeeperFilteredListRequest::ListRequestType;
             auto list_request_type = ALL;
+            bool with_stat = false;
+            bool with_data = false;
             if (auto * filtered_list_request = dynamic_cast<Coordination::ZooKeeperFilteredListRequest *>(&request_typed))
             {
                 list_request_type = filtered_list_request->list_request_type;
+                with_stat = filtered_list_request->with_stat;
+                with_data = filtered_list_request->with_data;
             }
 
-            auto & response_typed = dynamic_cast<Coordination::ZooKeeperListResponse &>(*response);
+            /// Cast to the ListResponse base: for OpNum 506 the concrete type is
+            /// ZooKeeperFilteredListWithStatsAndDataResponse, which is NOT a ZooKeeperListResponse.
+            auto & response_typed = dynamic_cast<Coordination::ListResponse &>(*response);
 
             response_typed.stat = node->statForResponse();
 
-            if (list_request_type == ALL)
+            auto matches_filter = [&](const auto & child) -> bool
             {
-                response_typed.names.reserve(node->children.size());
-                response_typed.names.push_back(node->children.begin(), node->children.end());
-                return {response, {}};
-            }
-
-            auto add_child = [&](const auto & child)
-            {
+                if (list_request_type == ALL)
+                    return true;
                 auto child_node = store.getNode(request_typed.path + "/" + child);
-                if (node == nullptr)
+                if (child_node == nullptr)
                 {
                     LOG_ERROR(
                         &Poco::Logger::get("StoreRequestList"),
@@ -887,15 +900,26 @@ struct StoreRequestList final : public StoreRequest
                         request_typed.path);
                     std::terminate();
                 }
-
                 const auto is_ephemeral = child_node->stat.ephemeralOwner != 0;
                 return (is_ephemeral && list_request_type == EPHEMERAL_ONLY) || (!is_ephemeral && list_request_type == PERSISTENT_ONLY);
             };
 
-            for (const auto & child: node->children)
+            response_typed.names.reserve(node->children.size());
+            for (const auto & child : node->children)
             {
-                if (add_child(child))
-                    response_typed.names.push_back(child);
+                if (!matches_filter(child))
+                    continue;
+
+                response_typed.names.push_back(child);
+
+                if (with_stat || with_data)
+                {
+                    auto child_node = store.getNode(request_typed.path + "/" + child);
+                    if (with_stat)
+                        response_typed.stats.push_back(child_node ? child_node->statForResponse() : Coordination::Stat{});
+                    if (with_data)
+                        response_typed.data.push_back(child_node ? child_node->data : String{});
+                }
             }
         }
         else

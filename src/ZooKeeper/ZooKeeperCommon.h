@@ -479,6 +479,7 @@ struct ZooKeeperFilteredListRequest final : ZooKeeperListRequest
     }
     void writeImpl(WriteBuffer & out) const override;
     void readImpl(ReadBuffer & in) override;
+    ZooKeeperResponsePtr makeResponse() const override;
     String toString() const override
     {
         return Coordination::toString(getOpNum()) + ", xid " + std::to_string(xid) + ", path " + path
@@ -512,6 +513,13 @@ struct ZooKeeperListResponse final : ListResponse, ZooKeeperResponse
         std::for_each(names.begin(), names.end(), func);
         return base;
     }
+};
+
+struct ZooKeeperFilteredListWithStatsAndDataResponse final : ListResponse, ZooKeeperResponse
+{
+    void readImpl(ReadBuffer & in) override;
+    void writeImpl(WriteBuffer & out) const override;
+    OpNum getOpNum() const override { return OpNum::FilteredListWithStatsAndData; }
 };
 
 struct ZooKeeperSimpleListResponse final : SimpleListResponse, ZooKeeperResponse

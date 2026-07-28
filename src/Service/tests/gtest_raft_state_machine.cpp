@@ -686,6 +686,10 @@ TEST(RaftStateMachine, RemoveRecursive)
     ASSERT_TRUE(machine.getStore().getNode("/a") != nullptr);
     ASSERT_TRUE(machine.getStore().getNode("/a/b/c") != nullptr);
 
+    /// Record parent (/) child count before removal
+    auto root_before = machine.getStore().getNode("/");
+    int32_t root_children_before = root_before->stat.numChildren;
+
     auto req = cs_new<ZooKeeperRemoveRecursiveRequest>();
     req->path = "/a";
     req->xid = 1;
@@ -699,6 +703,10 @@ TEST(RaftStateMachine, RemoveRecursive)
     ASSERT_EQ(machine.getStore().getNode("/a/b"), nullptr);
     ASSERT_EQ(machine.getStore().getNode("/a/b/c"), nullptr);
     ASSERT_EQ(machine.getStore().getNode("/a/d"), nullptr);
+
+    /// Parent stat must reflect the removed child (regression: issue #1)
+    auto root_after = machine.getStore().getNode("/");
+    ASSERT_EQ(root_after->stat.numChildren, root_children_before - 1);
 
     ResponseForSession r;
     ASSERT_TRUE(response_queue.tryPop(r));
@@ -850,9 +858,14 @@ TEST(RaftStateMachine, ListRecursive)
     req->path = "/subtree";
     req->xid = 1;
 
+    /// ListRecursive is read-only: zxid must not advance (regression: issue #2)
+    int64_t zxid_before = machine.getStore().getZxid();
+
     KeeperStore::KeeperResponsesQueue response_queue;
     int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
     machine.getStore().processRequest(response_queue, {req, session_id, time}, {}, true, false);
+
+    ASSERT_EQ(machine.getStore().getZxid(), zxid_before);
 
     ResponseForSession r;
     ASSERT_TRUE(response_queue.tryPop(r));
@@ -867,6 +880,67 @@ TEST(RaftStateMachine, ListRecursive)
     ASSERT_EQ(names[0], "/subtree/x");
     ASSERT_EQ(names[1], "/subtree/y");
     ASSERT_EQ(names[2], "/subtree/y/z");
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, FilteredListWithStatsAndData)
+{
+    String snap_dir(SNAP_DIR + "/flist_stats");
+    String log_dir(LOG_DIR + "/flist_stats");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+
+    setNode(machine.getStore(), "flist", "root", false, session_id);
+    setNode(machine.getStore(), "flist/x", "data_x", false, session_id);
+    setNode(machine.getStore(), "flist/y", "data_y", false, session_id);
+
+    auto req = cs_new<ZooKeeperFilteredListRequest>();
+    req->path = "/flist";
+    req->xid = 1;
+    req->list_with_stats_and_data = true;
+    req->with_stat = true;
+    req->with_data = true;
+    ASSERT_EQ(req->getOpNum(), OpNum::FilteredListWithStatsAndData);
+
+    int64_t zxid_before = machine.getStore().getZxid();
+
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(response_queue, {req, session_id, time}, {}, true, false);
+
+    ASSERT_EQ(machine.getStore().getZxid(), zxid_before);
+
+    ResponseForSession r;
+    ASSERT_TRUE(response_queue.tryPop(r));
+    ASSERT_EQ(r.response->error, Error::ZOK);
+
+    auto & resp = dynamic_cast<ZooKeeperFilteredListWithStatsAndDataResponse &>(*r.response);
+    ASSERT_EQ(resp.names.size(), 2u);
+    ASSERT_EQ(resp.stats.size(), 2u);
+    ASSERT_EQ(resp.data.size(), 2u);
+
+    size_t i = 0;
+    for (auto it = resp.names.begin(); it != resp.names.end(); ++it, ++i)
+    {
+        String name = (*it).toString();
+        if (name == "x")
+            ASSERT_EQ(resp.data[i], "data_x");
+        else if (name == "y")
+            ASSERT_EQ(resp.data[i], "data_y");
+        else
+            FAIL() << "unexpected child " << name;
+    }
 
     machine.shutdown();
     cleanDirectory(snap_dir);

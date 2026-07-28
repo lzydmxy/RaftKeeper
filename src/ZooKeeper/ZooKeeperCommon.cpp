@@ -344,6 +344,22 @@ void ZooKeeperListResponse::writeImpl(WriteBuffer & out) const
     Coordination::write(stat, out);
 }
 
+void ZooKeeperFilteredListWithStatsAndDataResponse::readImpl(ReadBuffer & in)
+{
+    Coordination::read(names, in);
+    Coordination::read(stat, in);
+    Coordination::read(stats, in);
+    Coordination::read(data, in);
+}
+
+void ZooKeeperFilteredListWithStatsAndDataResponse::writeImpl(WriteBuffer & out) const
+{
+    Coordination::write(names, out);
+    Coordination::write(stat, out);
+    Coordination::write(stats, out);
+    Coordination::write(data, out);
+}
+
 void ZooKeeperSimpleListResponse::readImpl(ReadBuffer & in)
 {
     Coordination::read(names, in);
@@ -655,11 +671,18 @@ ZooKeeperResponsePtr ZooKeeperSetWatchesRequest::makeResponse() const { return s
 ZooKeeperResponsePtr ZooKeeperSyncRequest::makeResponse() const { return std::make_shared<ZooKeeperSyncResponse>(); }
 ZooKeeperResponsePtr ZooKeeperAuthRequest::makeResponse() const { return std::make_shared<ZooKeeperAuthResponse>(); }
 ZooKeeperResponsePtr ZooKeeperCreateRequest::makeResponse() const { return std::make_shared<ZooKeeperCreateResponse>(); }
-ZooKeeperResponsePtr ZooKeeperRemoveRequest::makeResponse() const { return std::make_shared<ZooKeeperRemoveResponse>(); }
+ZooKeeperResponsePtr ZooKeeperRemoveRequest::makeResponse() const { return try_remove ? std::static_pointer_cast<ZooKeeperResponse>(std::make_shared<ZooKeeperTryRemoveResponse>()) : std::static_pointer_cast<ZooKeeperResponse>(std::make_shared<ZooKeeperRemoveResponse>()); }
 ZooKeeperResponsePtr ZooKeeperExistsRequest::makeResponse() const { return std::make_shared<ZooKeeperExistsResponse>(); }
 ZooKeeperResponsePtr ZooKeeperGetRequest::makeResponse() const { return std::make_shared<ZooKeeperGetResponse>(); }
 ZooKeeperResponsePtr ZooKeeperSetRequest::makeResponse() const { return std::make_shared<ZooKeeperSetResponse>(); }
 ZooKeeperResponsePtr ZooKeeperListRequest::makeResponse() const { return std::make_shared<ZooKeeperListResponse>(); }
+
+ZooKeeperResponsePtr ZooKeeperFilteredListRequest::makeResponse() const
+{
+    if (list_with_stats_and_data)
+        return std::make_shared<ZooKeeperFilteredListWithStatsAndDataResponse>();
+    return std::make_shared<ZooKeeperListResponse>();
+}
 ZooKeeperResponsePtr ZooKeeperSimpleListRequest::makeResponse() const { return std::make_shared<ZooKeeperSimpleListResponse>(); }
 ZooKeeperResponsePtr ZooKeeperCheckRequest::makeResponse() const { return not_exists ? std::make_shared<ZooKeeperCheckNotExistsResponse>() : std::make_shared<ZooKeeperCheckResponse>(); }
 ZooKeeperResponsePtr ZooKeeperCloseRequest::makeResponse() const { return std::make_shared<ZooKeeperCloseResponse>(); }

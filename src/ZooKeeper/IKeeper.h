@@ -311,6 +311,10 @@ struct ListResponse : virtual Response
 {
     CompactStrings names;
     Stat stat;
+
+    /// Optional per-child fields for FilteredListWithStatsAndData (populated only for OpNum 506).
+    std::vector<Stat> stats;
+    std::vector<String> data;
 };
 
 struct SimpleListResponse : virtual Response
