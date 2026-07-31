@@ -37,6 +37,7 @@ ResponsesForSessions WatchManager::processWatches(const String & path, Coordinat
         case Coordination::OpNum::Create:
             return processWatches(path, Coordination::Event::CREATED);
         case Coordination::OpNum::Remove:
+        case Coordination::OpNum::TryRemove:
             return processWatches(path, Coordination::Event::DELETED);
         case Coordination::OpNum::Set:
             return processWatches(path, Coordination::Event::CHANGED);
