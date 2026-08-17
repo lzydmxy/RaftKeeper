@@ -246,6 +246,63 @@ class ListRecursive(namedtuple('ListRecursive', 'path max_entries')):
         return children
 
 
+class CheckStat(namedtuple('CheckStat', 'path version cversion aversion')):
+    type = 504
+
+    def serialize(self):
+        b = bytearray()
+        b.extend(write_string(self.path))
+        b.extend(int_struct.pack(self.version))
+        b.extend(int_struct.pack(self.cversion))
+        b.extend(int_struct.pack(self.aversion))
+        return b
+
+    @classmethod
+    def deserialize(cls, bytes, offset):
+        return True
+
+
+class FilteredListWithStatsAndData(namedtuple('FilteredListWithStatsAndData', 'path watcher list_type with_stat with_data')):
+    type = 506
+
+    def serialize(self):
+        b = bytearray()
+        b.extend(write_string(self.path))
+        b.extend([1 if self.watcher else 0])
+        b.extend(struct.pack('B', self.list_type))
+        b.extend([1 if self.with_stat else 0])
+        b.extend([1 if self.with_data else 0])
+        return b
+
+    @classmethod
+    def deserialize(cls, bytes, offset):
+        # names
+        count = int_struct.unpack_from(bytes, offset)[0]
+        offset += int_struct.size
+        children = []
+        for _ in range(count):
+            child, offset = read_string(bytes, offset)
+            children.append(child)
+        # parent stat
+        stat = ZnodeStat._make(stat_struct.unpack_from(bytes, offset))
+        offset += stat_struct.size
+        # per-child stats
+        stats_count = int_struct.unpack_from(bytes, offset)[0]
+        offset += int_struct.size
+        stats = []
+        for _ in range(stats_count):
+            stats.append(ZnodeStat._make(stat_struct.unpack_from(bytes, offset)))
+            offset += stat_struct.size
+        # per-child data
+        data_count = int_struct.unpack_from(bytes, offset)[0]
+        offset += int_struct.size
+        data = []
+        for _ in range(data_count):
+            d, offset = read_buffer(bytes, offset)
+            data.append(d)
+        return children, stat, stats, data
+
+
 class KeeperFeatureClient(KazooClient):
     """A Zookeeper Python client extends from Kazoo.KazooClient,
     Kazoo is a Python library working with Zookeeper.
@@ -313,6 +370,24 @@ class KeeperFeatureClient(KazooClient):
         """
         async_result = self.handler.async_result()
         self._call(ListRecursive(_prefix_root(self.chroot, path), max_entries), async_result)
+        return async_result.get()
+
+    def check_stat(self, path, version=-1, cversion=-1, aversion=-1):
+        """Check a node's version/cversion/aversion (OpNum 504).
+
+        :returns: True on match. Raises on mismatch/missing node.
+        """
+        async_result = self.handler.async_result()
+        self._call(CheckStat(_prefix_root(self.chroot, path), version, cversion, aversion), async_result)
+        return async_result.get()
+
+    def list_children_with_stats_and_data(self, path, list_type=0, with_stat=True, with_data=True, watch=None):
+        """FilteredListWithStatsAndData (OpNum 506).
+
+        :returns: (children, stat, per_child_stats, per_child_data)
+        """
+        async_result = self.handler.async_result()
+        self._call(FilteredListWithStatsAndData(_prefix_root(self.chroot, path), watch, list_type, with_stat, with_data), async_result)
         return async_result.get()
 
     def get_filtered_children(self, path, watch=None, list_type=None, include_data=False):
@@ -651,6 +726,18 @@ class TransactionRequestExt(TransactionRequest):
         self._add(
             CheckIfNotExistsVersion(_prefix_root(self.client.chroot, path), version)
         )
+
+    def check_stat(self, path, version=-1, cversion=-1, aversion=-1):
+        """Add a CheckStat (OpNum 504) condition to the transaction."""
+        self._add(CheckStat(_prefix_root(self.client.chroot, path), version, cversion, aversion))
+
+    def try_remove(self, path, version=-1):
+        """Add a TryRemove (OpNum 505) to the transaction."""
+        self._add(TryRemove(_prefix_root(self.client.chroot, path), version))
+
+    def remove_recursive(self, path, remove_nodes_limit=0):
+        """Add a RemoveRecursive (OpNum 503) to the transaction."""
+        self._add(RemoveRecursive(_prefix_root(self.client.chroot, path), remove_nodes_limit))
 
     def create_if_not_exist(self, path, value=b"", acl=None, ephemeral=False,
                             sequence=False):

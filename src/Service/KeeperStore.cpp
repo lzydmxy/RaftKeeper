@@ -558,6 +558,11 @@ struct StoreRequestRemoveRecursive final : public StoreRequest
 {
     using StoreRequest::StoreRequest;
 
+    /// Paths actually removed (root + descendants), filled on success so the caller
+    /// can fire a DELETED watch for each. Recursive delete touches many nodes, but
+    /// watch firing is centralized in processRequest which only sees the root path.
+    mutable std::vector<String> removed_paths;
+
     bool checkAuth(KeeperStore & store, int64_t session_id) const override
     {
         auto parent = store.getNode(getParentPath(zk_request->getPath()));
@@ -666,6 +671,7 @@ struct StoreRequestRemoveRecursive final : public StoreRequest
         }
 
         response_typed.error = Coordination::Error::ZOK;
+        removed_paths = paths_to_remove;
 
         Undo undo = [&store, removed_nodes, root_base, root_parent_path, root_parent_pzxid, has_root_parent]
         {
@@ -1767,11 +1773,26 @@ void KeeperStore::processRequest(
                 }
                 else
                 {
-                    auto watch_responses = watch_manager.processWatches(zk_request->getPath(), zk_request->getOpNum());
-                    if (!watch_responses.empty())
+                    /// RemoveRecursive deletes a whole subtree; fire a DELETED watch for
+                    /// every removed node, not just the root (processWatches by opnum only
+                    /// covers the single request path).
+                    if (auto * rr = dynamic_cast<StoreRequestRemoveRecursive *>(store_request.get()))
                     {
-                        LOG_TRACE(log, "{} triggered {} watches", request_for_session.toSimpleString(), watch_responses.size());
-                        set_response(responses_queue, watch_responses, ignore_response);
+                        for (const auto & removed_path : rr->removed_paths)
+                        {
+                            auto watch_responses = watch_manager.processWatches(removed_path, Coordination::Event::DELETED);
+                            if (!watch_responses.empty())
+                                set_response(responses_queue, watch_responses, ignore_response);
+                        }
+                    }
+                    else
+                    {
+                        auto watch_responses = watch_manager.processWatches(zk_request->getPath(), zk_request->getOpNum());
+                        if (!watch_responses.empty())
+                        {
+                            LOG_TRACE(log, "{} triggered {} watches", request_for_session.toSimpleString(), watch_responses.size());
+                            set_response(responses_queue, watch_responses, ignore_response);
+                        }
                     }
                 }
             }
