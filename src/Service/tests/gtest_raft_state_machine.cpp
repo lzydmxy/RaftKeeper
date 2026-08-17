@@ -1003,3 +1003,69 @@ TEST(RaftStateMachine, MultiWriteWithCheckStatAndTryRemove)
     cleanDirectory(snap_dir);
     cleanDirectory(log_dir);
 }
+
+TEST(RaftStateMachine, MultiRemoveRecursiveRollback)
+{
+    String snap_dir(SNAP_DIR + "/multi_remrec_rollback");
+    String log_dir(LOG_DIR + "/multi_remrec_rollback");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+
+    /// Build subtree /r -> /r/a, /r/a/b, /r/c
+    setNode(machine.getStore(), "r", "root", false, session_id);
+    setNode(machine.getStore(), "r/a", "a_data", false, session_id);
+    setNode(machine.getStore(), "r/a/b", "b_data", false, session_id);
+    setNode(machine.getStore(), "r/c", "c_data", false, session_id);
+
+    auto root_parent = machine.getStore().getNode("/");
+    int32_t parent_children_before = root_parent->stat.numChildren;
+
+    /// Multi (write): RemoveRecursive(/r) then a Check that FAILS (wrong version on a
+    /// node that no longer needs to exist) -> whole multi must roll back, restoring /r.
+    auto multi = cs_new<ZooKeeperMultiRequest>();
+    multi->operation_type = ZooKeeperMultiRequest::OperationType::Write;
+    multi->xid = 20;
+    {
+        auto rr = cs_new<ZooKeeperRemoveRecursiveRequest>();
+        rr->path = "/r";
+        multi->requests.push_back(rr);
+    }
+    {
+        /// Check on a nonexistent path -> ZNONODE -> triggers rollback
+        auto ck = cs_new<ZooKeeperCheckRequest>();
+        ck->path = "/does_not_exist";
+        ck->version = -1;
+        multi->requests.push_back(ck);
+    }
+
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(response_queue, {multi, session_id, time}, {}, true, false);
+
+    ResponseForSession r;
+    ASSERT_TRUE(response_queue.tryPop(r));
+    /// Multi failed, so the whole subtree must be restored intact.
+    ASSERT_NE(machine.getStore().getNode("/r"), nullptr);
+    ASSERT_NE(machine.getStore().getNode("/r/a"), nullptr);
+    ASSERT_NE(machine.getStore().getNode("/r/a/b"), nullptr);
+    ASSERT_NE(machine.getStore().getNode("/r/c"), nullptr);
+    /// Data preserved
+    ASSERT_EQ(machine.getStore().getNode("/r/a/b")->data, "b_data");
+    /// Parent link + stat restored
+    ASSERT_TRUE(machine.getStore().getNode("/")->children.count("r") == 1);
+    ASSERT_EQ(machine.getStore().getNode("/")->stat.numChildren, parent_children_before);
+    /// /r still has both children
+    ASSERT_EQ(machine.getStore().getNode("/r")->children.size(), 2u);
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}

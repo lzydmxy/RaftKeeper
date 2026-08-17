@@ -616,11 +616,31 @@ struct StoreRequestRemoveRecursive final : public StoreRequest
             return {response, {}};
         }
 
+        /// Snapshot every node about to be removed so the operation can be rolled back
+        /// (required when RemoveRecursive is a subrequest of a multi transaction).
+        /// clone() preserves each node's own children set, so internal parent-child
+        /// links inside the subtree are restored automatically on re-add; only the
+        /// root's link into its surviving parent must be restored manually.
+        std::vector<std::pair<String, KeeperNodePtr>> removed_nodes;
+        removed_nodes.reserve(paths_to_remove.size());
+        for (const auto & path : paths_to_remove)
+        {
+            if (auto n = store.getNode(path))
+                removed_nodes.emplace_back(path, n->clone());
+        }
+
+        String root_base = getBaseName(request_typed.path);
+        String root_parent_path = getParentPath(request_typed.path);
+        int64_t root_parent_pzxid = 0;
+        bool has_root_parent = false;
+
         /// Update the surviving parent of the recursive-delete root: its child count
         /// drops by one and pzxid advances, matching StoreRequestRemove's behaviour.
         /// (Descendants' parents are themselves removed, so only this parent survives.)
-        if (auto root_parent = store.getNode(getParentPath(request_typed.path)))
+        if (auto root_parent = store.getNode(root_parent_path))
         {
+            has_root_parent = true;
+            root_parent_pzxid = root_parent->stat.pzxid;
             --root_parent->stat.numChildren;
             root_parent->stat.pzxid = zxid;
         }
@@ -646,7 +666,32 @@ struct StoreRequestRemoveRecursive final : public StoreRequest
         }
 
         response_typed.error = Coordination::Error::ZOK;
-        return {response, {}};
+
+        Undo undo = [&store, removed_nodes, root_base, root_parent_path, root_parent_pzxid, has_root_parent]
+        {
+            /// Re-add nodes root-first so parents exist before children are relinked.
+            /// Each clone already carries its own children set, so subtree links restore
+            /// automatically; we only relink the root into its surviving parent below.
+            for (const auto & [path, node] : removed_nodes)
+            {
+                store.addNode(path, node);
+                store.acl_map.addUsage(node->acl_id);
+                if (node->is_ephemeral)
+                    store.addEphemeralNode(node->stat.ephemeralOwner, path);
+            }
+
+            if (has_root_parent)
+            {
+                if (auto root_parent = store.getNode(root_parent_path))
+                {
+                    root_parent->children.insert(root_base);
+                    ++root_parent->stat.numChildren;
+                    root_parent->stat.pzxid = root_parent_pzxid;
+                }
+            }
+        };
+
+        return {response, undo};
     }
 };
 
@@ -1266,6 +1311,11 @@ struct StoreRequestMultiTxn final : public StoreRequest
             {
                 check_operation_type(OperationType::Write);
                 concrete_requests.push_back(std::make_shared<StoreRequestCheckStat>(sub_zk_request));
+            }
+            else if (sub_zk_request->getOpNum() == Coordination::OpNum::RemoveRecursive)
+            {
+                check_operation_type(OperationType::Write);
+                concrete_requests.push_back(std::make_shared<StoreRequestRemoveRecursive>(sub_zk_request));
             }
             else if (sub_zk_request->getOpNum() == Coordination::OpNum::Get)
             {
