@@ -238,3 +238,123 @@ def test_invalid_timeout_setting(started_cluster):
     node1.replace_in_config('/etc/raftkeeper-server/config.d/enable_keeper1.xml', '200', '12000')
     node1.start_raftkeeper()
 
+
+def send_raw_request(client, xid, op_num, body=b""):
+    """Frame a ZK request: [len][xid][opnum][body] where len covers xid+opnum+body."""
+    req = int_struct.pack(8 + len(body)) + int_struct.pack(xid) + int_struct.pack(op_num) + body
+    client.send(req)
+
+
+def recv_reply(client):
+    """Read one framed reply: returns (xid, zxid, err, body)."""
+    data = b""
+    while len(data) < 4:
+        chunk = client.recv(100_000)
+        if not chunk:
+            break
+        data += chunk
+    assert len(data) >= 4, "Connection closed before reply header"
+    length = int_struct.unpack_from(data, 0)[0]
+    while len(data) < 4 + length:
+        chunk = client.recv(100_000)
+        if not chunk:
+            break
+        data += chunk
+    assert len(data) >= 4 + length, "Connection closed mid-reply"
+    xid, zxid, err = reply_header_struct.unpack_from(data, 4)
+    return xid, zxid, err, data[20 : 4 + length]
+
+
+def test_unknown_opnum_gets_error_and_connection_survives(started_cluster):
+    wait_nodes()
+
+    client = handshake(node1.name)
+
+    # Opnum 16 (Reconfig) is unknown to RaftKeeper: it must answer with a clean
+    # error reply instead of dropping the request silently (or the connection).
+    send_raw_request(client, xid=100, op_num=16, body=int_struct.pack(0))
+    xid, zxid, err, body = recv_reply(client)
+    assert xid == 100
+    assert err != 0
+    assert len(body) == 0
+
+    # The connection must still be usable afterwards.
+    send_raw_request(client, xid=101, op_num=11)
+    xid, zxid, err, body = recv_reply(client)
+    assert xid == 101
+    assert err == 0
+
+    close_keeper_socket(client)
+
+
+def test_ttl_create_rejected_and_stream_stays_aligned(started_cluster):
+    wait_nodes()
+
+    client = handshake(node1.name)
+
+    path_buf = write_buffer(b"/ttl_node")
+    data_buf = write_buffer(b"ttl_data")
+    no_acls = int_struct.pack(0)
+
+    # ZK 3.5+ PERSISTENT_WITH_TTL appends an int64 ttl after the flags. RaftKeeper
+    # must consume it, reject the mode, and keep the stream aligned for the next
+    # request on the same connection.
+    send_raw_request(
+        client, xid=200, op_num=1,
+        body=path_buf + data_buf + no_acls + int_struct.pack(5) + long_struct.pack(60000),
+    )
+    xid, zxid, err, body = recv_reply(client)
+    assert xid == 200
+    assert err == -6  # ZUNIMPLEMENTED
+
+    # Container mode: rejected cleanly (matches ClickHouse Keeper).
+    send_raw_request(
+        client, xid=201, op_num=1,
+        body=path_buf + data_buf + no_acls + int_struct.pack(4),
+    )
+    xid, zxid, err, body = recv_reply(client)
+    assert xid == 201
+    assert err == -8  # ZBADARGUMENTS
+
+    # The stream must still be aligned: a normal create succeeds, proving the
+    # trailing ttl bytes were consumed rather than parsed as the next request.
+    one_world_acl = (
+        int_struct.pack(1)
+        + int_struct.pack(31)
+        + write_buffer(b"world")
+        + write_buffer(b"anyone")
+    )
+    send_raw_request(
+        client, xid=202, op_num=1,
+        body=write_buffer(b"/plain_node") + write_buffer(b"data") + one_world_acl + int_struct.pack(0),
+    )
+    xid, zxid, err, body = recv_reply(client)
+    assert xid == 202
+    assert err == 0
+
+    close_keeper_socket(client)
+
+
+def test_multi_with_unsupported_subop_returns_error_and_server_survives(started_cluster):
+    wait_nodes()
+
+    client = handshake(node1.name)
+
+    # A Multi containing GetACL as a sub-op is unsupported. It must fail with
+    # ZBADARGUMENTS and, critically, must NOT abort the server process (which is
+    # what used to happen when the validation threw at Raft apply time).
+    get_acl_sub = int_struct.pack(6) + bool_struct.pack(0) + int_struct.pack(-1) + write_buffer(b"/some_node")
+    multi_terminator = int_struct.pack(-1) + bool_struct.pack(1) + int_struct.pack(-1)
+    send_raw_request(client, xid=300, op_num=14, body=get_acl_sub + multi_terminator)
+    xid, zxid, err, body = recv_reply(client)
+    assert xid == 300
+    assert err == -8  # ZBADARGUMENTS
+
+    # The server must still be alive: a write through a full client needs a live
+    # leader (the bad multi is applied on the leader before it answers).
+    fake_zk = get_fake_zk(node1.name)
+    fake_zk.create("/post_multi_survived")
+    assert fake_zk.exists("/post_multi_survived") is not None
+    fake_zk.stop()
+
+    close_keeper_socket(client)

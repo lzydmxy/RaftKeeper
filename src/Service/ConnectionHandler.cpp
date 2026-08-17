@@ -577,19 +577,35 @@ std::pair<Coordination::OpNum, Coordination::XID> ConnectionHandler::receiveRequ
 {
     ReadBufferFromMemory body(req_body_buf->begin(), req_body_buf->used());
     int32_t xid;
+    int32_t raw_opnum;
     Coordination::read(xid, body);
+    /// Read the raw int32 instead of the validated OpNum overload: getOpNum throws
+    /// for unknown opnums, and we want that to happen inside the try below so the
+    /// client gets an error reply rather than a silently dropped request.
+    Coordination::read(raw_opnum, body);
+    Coordination::OpNum opnum = static_cast<Coordination::OpNum>(raw_opnum);
 
-    Coordination::OpNum opnum;
-    Coordination::read(opnum, body);
+    try
+    {
+        LOG_DEBUG(log, "Receive request #{}#{}#{}", toHexString(session_id.load()), xid, Coordination::toString(opnum));
 
-    LOG_DEBUG(log, "Receive request #{}#{}#{}", toHexString(session_id.load()), xid, Coordination::toString(opnum));
+        Coordination::ZooKeeperRequestPtr request = Coordination::ZooKeeperRequestFactory::instance().get(opnum);
+        request->xid = xid;
+        request->readImpl(body);
 
-    Coordination::ZooKeeperRequestPtr request = Coordination::ZooKeeperRequestFactory::instance().get(opnum);
-    request->xid = xid;
-    request->readImpl(body);
-
-    if (!keeper_dispatcher->pushRequest(request, session_id))
-        throw Exception(ErrorCodes::TIMEOUT_EXCEEDED, "Session {} already disconnected", toHexString(session_id.load()));
+        if (!keeper_dispatcher->pushRequest(request, session_id))
+            throw Exception(ErrorCodes::TIMEOUT_EXCEEDED, "Session {} already disconnected", toHexString(session_id.load()));
+    }
+    catch (const Coordination::Exception & e)
+    {
+        /// Unknown opnum, or a request we can't parse. The body is already fully read,
+        /// so the stream stays aligned; answer with an error instead of dropping the
+        /// request silently, which would leave the client hanging until its timeout.
+        auto response = std::make_shared<Coordination::ZooKeeperErrorResponse>();
+        response->xid = xid;
+        response->error = e.code;
+        pushUserResponseToSendingQueue(response);
+    }
     return std::make_pair(opnum, xid);
 }
 

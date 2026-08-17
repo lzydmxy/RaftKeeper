@@ -1274,8 +1274,16 @@ struct StoreRequestMultiTxn final : public StoreRequest
     using OperationType = Coordination::ZooKeeperMultiRequest::OperationType;
     OperationType operation_type = OperationType::Unspecified;
 
+    /// Set when a subrequest is not supported (unknown opnum, or a mix of read and
+    /// write subrequests). The constructor must not throw: it runs at Raft apply time,
+    /// where RequestProcessor::applyRequest aborts the whole server on any exception.
+    Coordination::Error construction_error = Coordination::Error::ZOK;
+
     bool checkAuth(KeeperStore & store, int64_t session_id) const override
     {
+        /// Let process() answer with construction_error instead of a misleading ZNOAUTH.
+        if (construction_error != Coordination::Error::ZOK)
+            return true;
         for (const auto & concrete_request : concrete_requests)
             if (!concrete_request->checkAuth(store, session_id))
                 return false;
@@ -1291,7 +1299,7 @@ struct StoreRequestMultiTxn final : public StoreRequest
         const auto check_operation_type = [&](OperationType type)
         {
             if (operation_type != OperationType::Unspecified && operation_type != type)
-                throw RK::Exception(ErrorCodes::BAD_ARGUMENTS, "Illegal mixing of read and write operations in multi request");
+                construction_error = Coordination::Error::ZBADARGUMENTS;
             operation_type = type;
         };
 
@@ -1346,8 +1354,7 @@ struct StoreRequestMultiTxn final : public StoreRequest
                 concrete_requests.push_back(std::make_shared<StoreRequestList>(sub_zk_request));
             }
             else
-                throw RK::Exception(
-                    ErrorCodes::BAD_ARGUMENTS, "Illegal command as part of multi ZooKeeper request {}", toString(sub_zk_request->getOpNum()));
+                construction_error = Coordination::Error::ZBADARGUMENTS;
         }
     }
 
@@ -1356,6 +1363,15 @@ struct StoreRequestMultiTxn final : public StoreRequest
     {
         Coordination::ZooKeeperResponsePtr response = zk_request->makeResponse();
         Coordination::ZooKeeperMultiResponse & response_typed = dynamic_cast<Coordination::ZooKeeperMultiResponse &>(*response);
+
+        /// Reject unsupported multis with a clean error instead of throwing at apply
+        /// time, where the exception would abort the server process.
+        if (construction_error != Coordination::Error::ZOK)
+        {
+            response_typed.error = construction_error;
+            return {response, {}};
+        }
+
         std::vector<Undo> undo_actions;
 
         try
@@ -1642,12 +1658,22 @@ void KeeperStore::processRequest(
         auto * request = dynamic_cast<Coordination::ZooKeeperSetWatchesRequest *>(zk_request.get());
 
         /// path -> mzixd pzxid
+        /// Populated from every watch array: child and exist watches need the same node
+        /// info as data watches, otherwise every re-established child watch is treated
+        /// as "node missing" and spuriously fires DELETED (and is dropped), and exist
+        /// watches never fire CREATED for nodes created during the disconnect.
         std::unordered_map<String, std::pair<int64_t, int64_t>> watch_nodes_info;
-        for (String & path : request->data_watches)
+        const auto add_watch_nodes_info = [&](const std::vector<String> & paths)
         {
-            if (auto node = data_tree.get(path))
-                watch_nodes_info.emplace(path, std::make_pair(node->stat.mzxid, node->stat.pzxid));
-        }
+            for (const String & path : paths)
+            {
+                if (auto node = data_tree.get(path))
+                    watch_nodes_info.emplace(path, std::make_pair(node->stat.mzxid, node->stat.pzxid));
+            }
+        };
+        add_watch_nodes_info(request->data_watches);
+        add_watch_nodes_info(request->exist_watches);
+        add_watch_nodes_info(request->list_watches);
 
         auto watch_responses = watch_manager.processRequestSetWatch(request_for_session, watch_nodes_info);
         set_response(responses_queue, watch_responses, ignore_response);
