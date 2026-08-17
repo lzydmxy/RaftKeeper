@@ -13,7 +13,8 @@ void WatchManager::registerWatches(const String & path, int64_t session_id, Coor
     std::lock_guard lock(watch_mutex);
     auto watches_type = opnum == Coordination::OpNum::List
             || opnum == Coordination::OpNum::SimpleList
-            || opnum == Coordination::OpNum::FilteredList ? WatchType::List : WatchType::Data;
+            || opnum == Coordination::OpNum::FilteredList
+            || opnum == Coordination::OpNum::FilteredListWithStatsAndData ? WatchType::List : WatchType::Data;
 
     switch (watches_type)
     {
