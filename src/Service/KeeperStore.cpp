@@ -1246,7 +1246,8 @@ struct StoreRequestMultiTxn final : public StoreRequest
                 check_operation_type(OperationType::Write);
                 concrete_requests.push_back(std::make_shared<StoreRequestCreate>(sub_zk_request));
             }
-            else if (sub_zk_request->getOpNum() == Coordination::OpNum::Remove)
+            else if (sub_zk_request->getOpNum() == Coordination::OpNum::Remove
+                     || sub_zk_request->getOpNum() == Coordination::OpNum::TryRemove)
             {
                 check_operation_type(OperationType::Write);
                 concrete_requests.push_back(std::make_shared<StoreRequestRemove>(sub_zk_request));
@@ -1260,6 +1261,11 @@ struct StoreRequestMultiTxn final : public StoreRequest
             {
                 check_operation_type(OperationType::Write);
                 concrete_requests.push_back(std::make_shared<StoreRequestCheck>(sub_zk_request));
+            }
+            else if (sub_zk_request->getOpNum() == Coordination::OpNum::CheckStat)
+            {
+                check_operation_type(OperationType::Write);
+                concrete_requests.push_back(std::make_shared<StoreRequestCheckStat>(sub_zk_request));
             }
             else if (sub_zk_request->getOpNum() == Coordination::OpNum::Get)
             {

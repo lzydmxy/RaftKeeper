@@ -946,3 +946,60 @@ TEST(RaftStateMachine, FilteredListWithStatsAndData)
     cleanDirectory(snap_dir);
     cleanDirectory(log_dir);
 }
+
+TEST(RaftStateMachine, MultiWriteWithCheckStatAndTryRemove)
+{
+    String snap_dir(SNAP_DIR + "/multi_checkstat_tryremove");
+    String log_dir(LOG_DIR + "/multi_checkstat_tryremove");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+
+    setNode(machine.getStore(), "mnode", "data", false, session_id);
+    auto node = machine.getStore().getNode("/mnode");
+    int32_t ver = node->stat.version;
+
+    /// Multi (write): CheckStat(correct version) + TryRemove(existing) must both succeed.
+    auto multi = cs_new<ZooKeeperMultiRequest>();
+    multi->operation_type = ZooKeeperMultiRequest::OperationType::Write;
+    multi->xid = 10;
+    {
+        auto cs = cs_new<ZooKeeperCheckStatRequest>();
+        cs->path = "/mnode";
+        cs->version = ver;
+        cs->cversion = -1;
+        cs->aversion = -1;
+        multi->requests.push_back(cs);
+    }
+    {
+        auto tr = cs_new<ZooKeeperRemoveRequest>();
+        tr->path = "/mnode";
+        tr->try_remove = true;
+        tr->version = -1;
+        multi->requests.push_back(tr);
+    }
+
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(response_queue, {multi, session_id, time}, {}, true, false);
+
+    ResponseForSession r;
+    ASSERT_TRUE(response_queue.tryPop(r));
+    auto & multi_resp = dynamic_cast<ZooKeeperMultiResponse &>(*r.response);
+    ASSERT_EQ(multi_resp.responses.size(), 2u);
+    ASSERT_EQ(multi_resp.responses[0]->error, Error::ZOK);
+    ASSERT_EQ(multi_resp.responses[1]->error, Error::ZOK);
+    /// Node removed by the TryRemove sub-op
+    ASSERT_EQ(machine.getStore().getNode("/mnode"), nullptr);
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
