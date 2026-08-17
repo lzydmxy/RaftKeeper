@@ -1693,6 +1693,8 @@ void KeeperStore::processRequest(
             auto sub_opnum = sub_zk_request->getOpNum();
 
             /// MultiRead only allows read operations. Writes routed here would bypass Raft consensus.
+            /// Reject with a clean per-subrequest error instead of throwing: read-path
+            /// exceptions produce no response and the client would hang until timeout.
             if (sub_opnum != Coordination::OpNum::Get
                 && sub_opnum != Coordination::OpNum::Exists
                 && sub_opnum != Coordination::OpNum::List
@@ -1700,10 +1702,12 @@ void KeeperStore::processRequest(
                 && sub_opnum != Coordination::OpNum::FilteredList
                 && sub_opnum != Coordination::OpNum::GetACL)
             {
-                throw Exception(
-                    ErrorCodes::BAD_ARGUMENTS,
-                    "Illegal command {} as part of MultiRead request",
-                    Coordination::toString(sub_opnum));
+                auto sub_response = std::make_shared<Coordination::ZooKeeperErrorResponse>();
+                sub_response->error = Coordination::Error::ZBADARGUMENTS;
+                sub_response->xid = sub_zk_request->xid;
+                sub_response->zxid = zxid.load();
+                multi_response.responses[i] = sub_response;
+                continue;
             }
 
             auto sub_store_request = StoreRequestFactory::instance().get(sub_zk_request);

@@ -526,12 +526,19 @@ TEST(RaftStateMachine, MultiReadRejectsWriteOps)
 
     KeeperStore::KeeperResponsesQueue response_queue;
     int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
-    EXPECT_THROW(
-        {
-            machine.getStore().processRequest(
-                response_queue, {multi_read, session_id, time}, {}, /*check_acl=*/true, /*ignore_response=*/false);
-        },
-        RK::Exception);
+    /// The bad sub-op must produce a clean per-subrequest error response — a throw
+    /// here would leave the client hanging (read-path exceptions send no response).
+    machine.getStore().processRequest(
+        response_queue, {multi_read, session_id, time}, {}, /*check_acl=*/true, /*ignore_response=*/false);
+
+    ResponseForSession response_for_session;
+    ASSERT_TRUE(response_queue.tryPop(response_for_session));
+    auto & multi_response = dynamic_cast<ZooKeeperMultiResponse &>(*response_for_session.response);
+    ASSERT_EQ(multi_response.responses.size(), 2u);
+    /// The valid read sub-op still succeeds.
+    ASSERT_EQ(multi_response.responses[0]->error, Error::ZOK);
+    /// The write sub-op is rejected with ZBADARGUMENTS at its own position.
+    ASSERT_EQ(multi_response.responses[1]->error, Error::ZBADARGUMENTS);
 
     machine.shutdown();
     cleanDirectory(snap_dir);
@@ -1273,6 +1280,20 @@ TEST(RaftStateMachine, SetWatchesRestoresChildAndExistWatches)
     set_watches->list_watches.emplace_back("/parent");
     set_watches->list_watches.emplace_back("/leaf");
 
+    /// Another session also watches /parent. The restore must fire only the
+    /// re-registering session's own watch — session2's watch must survive and must
+    /// not receive a spurious event.
+    int64_t session2 = machine.getStore().getSessionID(30000);
+    {
+        auto get_req = cs_new<ZooKeeperGetRequest>();
+        get_req->path = "/parent";
+        get_req->has_watch = true;
+        get_req->xid = 703;
+        KeeperStore::KeeperResponsesQueue rsp_queue;
+        int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+        machine.getStore().processRequest(rsp_queue, {get_req, session2, time}, {}, /*check_acl=*/true, /*ignore_response=*/true);
+    }
+
     uint64_t watches_before = machine.getStore().getTotalWatchesCount();
 
     KeeperStore::KeeperResponsesQueue response_queue;
@@ -1285,7 +1306,11 @@ TEST(RaftStateMachine, SetWatchesRestoresChildAndExistWatches)
     while (response_queue.tryPop(response_for_session))
     {
         if (auto * watch_response = dynamic_cast<Coordination::ZooKeeperWatchResponse *>(response_for_session.response.get()))
+        {
             fired.emplace(watch_response->path, watch_response->type);
+            /// Fired events must only ever go to the re-registering session.
+            ASSERT_EQ(response_for_session.session_id, session_id);
+        }
     }
 
     ASSERT_EQ(fired.count(std::make_pair(String("/data_gone"), Coordination::Event::DELETED)), 1u);
@@ -1297,7 +1322,8 @@ TEST(RaftStateMachine, SetWatchesRestoresChildAndExistWatches)
     ASSERT_EQ(fired.count(std::make_pair(String("/leaf"), Coordination::Event::CHILD)), 0u);
     ASSERT_EQ(fired.count(std::make_pair(String("/leaf"), Coordination::Event::DELETED)), 0u);
 
-    /// Silent registrations survive: exist watch on /exist_gone + child watch on /leaf.
+    /// Silent registrations survive (exist watch on /exist_gone + child watch on
+    /// /leaf), and session2's /parent watch was not consumed by the restore.
     ASSERT_EQ(machine.getStore().getTotalWatchesCount(), watches_before + 2);
 
     machine.shutdown();

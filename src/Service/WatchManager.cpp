@@ -132,6 +132,39 @@ ResponsesForSessions WatchManager::processWatches(const String & path, Coordinat
 }
 
 
+ResponsesForSessions WatchManager::triggerWatchForSession(
+    int64_t session_id, const String & path, Coordination::Event event_type, WatchType watch_type)
+{
+    std::lock_guard lock(watch_mutex);
+
+    ResponsesForSessions result;
+    auto & path_watches = watch_type == WatchType::List ? list_watches : watches;
+    auto it = path_watches.find(path);
+    if (it != path_watches.end() && it->second.contains(session_id))
+    {
+        std::shared_ptr<Coordination::ZooKeeperWatchResponse> watch_response = std::make_shared<Coordination::ZooKeeperWatchResponse>();
+        watch_response->path = path;
+        watch_response->xid = Coordination::WATCH_XID;
+        watch_response->zxid = -1;
+        watch_response->type = event_type;
+        watch_response->state = Coordination::State::CONNECTED;
+        result.push_back(ResponseForSession{session_id, watch_response});
+
+        it->second.erase(session_id);
+        if (it->second.empty())
+            path_watches.erase(it);
+
+        LOG_TRACE(log, "Unregister watch for path={}, session_id={}, data={}", path, toHexString(session_id), toString(sessions_and_watchers[session_id][path]));
+        if ((sessions_and_watchers[session_id][path] ^= static_cast<uint8_t>(watch_type)) == 0)
+        {
+            sessions_and_watchers[session_id].erase(path);
+            LOG_TRACE(log, "Unregister sessions_and_watchers path={}, session_id={}", path, toHexString(session_id));
+        }
+    }
+
+    return result;
+}
+
 ResponsesForSessions WatchManager::processRequestSetWatch(
     const RequestForSession & request_for_session, std::unordered_map<String, std::pair<int64_t, int64_t>> & watch_nodes_info)
 {
@@ -141,8 +174,8 @@ ResponsesForSessions WatchManager::processRequestSetWatch(
     auto session_id = request_for_session.session_id;
 
     /// Register all watches first, then trigger the ones that must fire immediately.
-    /// Triggering calls processWatches, which locks watch_mutex itself — it must not
-    /// run while we hold the lock (non-recursive mutex, would deadlock).
+    /// Triggering locks watch_mutex itself — it must not run while we hold the lock
+    /// (non-recursive mutex, would deadlock).
     {
         std::lock_guard lock(watch_mutex);
         for (String & path : request->data_watches)
@@ -169,19 +202,20 @@ ResponsesForSessions WatchManager::processRequestSetWatch(
 
     for (String & path : request->data_watches)
     {
-        /// trigger watches
+        /// trigger watches — only the re-registering session's own watch, no parent
+        /// cascade (ZooKeeper's DataTree.setWatches semantics)
         if (!watch_nodes_info.contains(path))
         {
             LOG_TRACE(
                 log, "Trigger data_watches when processing SetWatch operation for session {}, path {}", toHexString(session_id), path);
-            auto watch_responses = processWatches(path, Coordination::Event::DELETED);
+            auto watch_responses = triggerWatchForSession(session_id, path, Coordination::Event::DELETED, WatchType::Data);
             responses.insert(responses.end(), watch_responses.begin(), watch_responses.end());
         }
         else if (watch_nodes_info[path].first > request->relative_zxid)
         {
             LOG_TRACE(
                 log, "Trigger data_watches when processing SetWatch operation for session {}, path {}", toHexString(session_id), path);
-            auto watch_responses = processWatches(path, Coordination::Event::CHANGED);
+            auto watch_responses = triggerWatchForSession(session_id, path, Coordination::Event::CHANGED, WatchType::Data);
             responses.insert(responses.end(), watch_responses.begin(), watch_responses.end());
         }
     }
@@ -193,7 +227,7 @@ ResponsesForSessions WatchManager::processRequestSetWatch(
         {
             LOG_TRACE(
                 log, "Trigger exist_watches when processing SetWatch operation for session {}, path {}", toHexString(session_id), path);
-            auto watch_responses = processWatches(path, Coordination::Event::CREATED);
+            auto watch_responses = triggerWatchForSession(session_id, path, Coordination::Event::CREATED, WatchType::Data);
             responses.insert(responses.end(), watch_responses.begin(), watch_responses.end());
         }
     }
@@ -205,7 +239,7 @@ ResponsesForSessions WatchManager::processRequestSetWatch(
         {
             LOG_TRACE(
                 log, "Trigger list_watches when processing SetWatch operation for session {}, path {}", toHexString(session_id), path);
-            auto watch_responses = processWatches(path, Coordination::Event::DELETED);
+            auto watch_responses = triggerWatchForSession(session_id, path, Coordination::Event::DELETED, WatchType::List);
             responses.insert(responses.end(), watch_responses.begin(), watch_responses.end());
         }
         else if (watch_nodes_info[path].second > request->relative_zxid)
@@ -214,7 +248,7 @@ ResponsesForSessions WatchManager::processRequestSetWatch(
                 log, "Trigger list_watches when processing SetWatch operation for session {}, path {}", toHexString(session_id), path);
             /// Note: ClickHouse Keeper fires CHANGED here; real ZooKeeper fires
             /// NodeChildrenChanged. We follow ZooKeeper semantics for a child watch.
-            auto watch_responses = processWatches(path, Coordination::Event::CHILD);
+            auto watch_responses = triggerWatchForSession(session_id, path, Coordination::Event::CHILD, WatchType::List);
             responses.insert(responses.end(), watch_responses.begin(), watch_responses.end());
         }
     }

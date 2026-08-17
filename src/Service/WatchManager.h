@@ -54,6 +54,13 @@ public:
     void reset();
 
 private:
+    /// Fire and unregister a single session's own watch on `path`. Unlike
+    /// processWatches, it does not touch other sessions' watches and does not
+    /// cascade to parent paths: ZooKeeper's DataTree.setWatches fires only the
+    /// re-registering session's watcher.
+    ResponsesForSessions triggerWatchForSession(
+        int64_t session_id, const String & path, Coordination::Event event_type, WatchType watch_type);
+
     /// Session id -> node path
     SessionAndWatcher sessions_and_watchers;
     /// Node path -> session id. Watches for 'get' and 'exist' requests
