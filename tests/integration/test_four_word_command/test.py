@@ -294,7 +294,10 @@ def test_cmd_conf(started_cluster):
         assert result["client_req_timeout_ms"] == result["operation_timeout_ms"]
         assert result["min_session_timeout_ms"] == "1000"
         assert result["max_session_timeout_ms"] == "30000"
-        assert result["operation_timeout_ms"] == "1000"
+        # 10s, not the 3s default: under sanitizer slowdown a 1s client_req_timeout
+        # makes commits exceed it, hitting NuRaft's commit-callback timeout path
+        # (which has an unsynchronized read that tsan reports as a data race).
+        assert result["operation_timeout_ms"] == "10000"
         assert result["dead_session_check_period_ms"] == "500"
         assert result["heart_beat_interval_ms"] == "500"
         assert result["election_timeout_lower_bound_ms"] == "3000"
