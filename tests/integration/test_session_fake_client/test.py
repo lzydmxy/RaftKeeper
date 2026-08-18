@@ -185,14 +185,14 @@ def test_session_max_min_session_timeout(started_cluster):
     assert len(heartbeat(client2)) > 0
     assert len(heartbeat(client3)) > 0
 
-    time.sleep(2)
-    # 2s after the first heartbeat, client1 session should expire
+    time.sleep(3)
+    # 3s after the first heartbeat, client1 session should expire
     assert len(heartbeat(client1)) == 0
     assert len(heartbeat(client2)) > 0
     assert len(heartbeat(client3)) > 0
 
-    time.sleep(5)
-    # 5s after the second heartbeat, client2 session should expire
+    time.sleep(6)
+    # 6s after the second heartbeat, client2 session should expire
     assert len(heartbeat(client2)) == 0
     assert len(heartbeat(client3)) > 0
 
