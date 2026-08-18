@@ -456,6 +456,11 @@ struct StoreRequestRemove final : public StoreRequest
 {
     using StoreRequest::StoreRequest;
 
+    /// Filled by process(): true only when a node was actually removed.
+    /// TryRemove returns ZOK even for a missing node, so watch firing must
+    /// check this (mirrors RemoveRecursive::removed_paths).
+    mutable bool removed = false;
+
     bool checkAuth(KeeperStore & store, int64_t session_id) const override
     {
         auto parent = store.getNode(getParentPath(zk_request->getPath()));
@@ -548,6 +553,7 @@ struct StoreRequestRemove final : public StoreRequest
                     undo_parent->children.insert(child_basename);
                 }
             };
+            removed = true;
         }
 
         return {response_ptr, undo};
@@ -1759,9 +1765,16 @@ void KeeperStore::processRequest(
                     if (!multi_response->responses.empty() && multi_response->responses.back()->error == Coordination::Error::ZOK)
                     {
                         auto * multi_request = dynamic_cast<Coordination::ZooKeeperMultiRequest *>(zk_request.get());
-                        for (auto & concrete_request : multi_request->requests)
+                        const auto * multi_txn = dynamic_cast<const StoreRequestMultiTxn *>(store_request.get());
+                        for (size_t i = 0; i < multi_request->requests.size(); ++i)
                         {
-                            const auto * sub_zk_request = dynamic_cast<Coordination::ZooKeeperRequest *>(concrete_request.get());
+                            const auto * sub_zk_request = dynamic_cast<Coordination::ZooKeeperRequest *>(multi_request->requests[i].get());
+                            /// TryRemove sub-op returns ZOK without deleting a missing
+                            /// node — must not fire a spurious DELETED watch for it.
+                            const auto * sub_remove
+                                = multi_txn ? dynamic_cast<const StoreRequestRemove *>(multi_txn->concrete_requests[i].get()) : nullptr;
+                            if (sub_remove && !sub_remove->removed)
+                                continue;
                             auto watch_responses = watch_manager.processWatches(sub_zk_request->getPath(), sub_zk_request->getOpNum());
                             if (!watch_responses.empty())
                             {
@@ -1787,11 +1800,19 @@ void KeeperStore::processRequest(
                     }
                     else
                     {
-                        auto watch_responses = watch_manager.processWatches(zk_request->getPath(), zk_request->getOpNum());
-                        if (!watch_responses.empty())
+                        /// TryRemove succeeds (ZOK) without deleting anything when the
+                        /// node is missing — must not fire a spurious DELETED watch.
+                        const auto * remove_request = dynamic_cast<const StoreRequestRemove *>(store_request.get());
+                        const bool actually_removed = !remove_request || remove_request->removed;
+
+                        if (actually_removed)
                         {
-                            LOG_TRACE(log, "{} triggered {} watches", request_for_session.toSimpleString(), watch_responses.size());
-                            set_response(responses_queue, watch_responses, ignore_response);
+                            auto watch_responses = watch_manager.processWatches(zk_request->getPath(), zk_request->getOpNum());
+                            if (!watch_responses.empty())
+                            {
+                                LOG_TRACE(log, "{} triggered {} watches", request_for_session.toSimpleString(), watch_responses.size());
+                                set_response(responses_queue, watch_responses, ignore_response);
+                            }
                         }
                     }
                 }

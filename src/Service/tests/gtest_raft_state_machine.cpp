@@ -757,6 +757,24 @@ TEST(RaftStateMachine, TryRemove)
         req->try_remove = true;
         req->xid = 2;
 
+        /// Register a data watch on the missing node, then verify TryRemove
+        /// on a nonexistent path does NOT fire it.
+        uint64_t watches_before = machine.getStore().getTotalWatchesCount();
+        {
+            /// Exists (unlike Get) registers a data watch even on a missing path
+            auto exists_req = cs_new<ZooKeeperExistsRequest>();
+            exists_req->path = "/nonexistent";
+            exists_req->has_watch = true;
+            exists_req->xid = 3;
+
+            KeeperStore::KeeperResponsesQueue watch_queue;
+            int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+            machine.getStore().processRequest(watch_queue, {exists_req, session_id, time}, {}, true, false);
+            ResponseForSession reg;
+            ASSERT_TRUE(watch_queue.tryPop(reg));
+        }
+        ASSERT_EQ(machine.getStore().getTotalWatchesCount(), watches_before + 1);
+
         KeeperStore::KeeperResponsesQueue response_queue;
         int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
         machine.getStore().processRequest(response_queue, {req, session_id, time}, {}, true, false);
@@ -764,6 +782,10 @@ TEST(RaftStateMachine, TryRemove)
         ResponseForSession r;
         ASSERT_TRUE(response_queue.tryPop(r));
         ASSERT_EQ(r.response->error, Error::ZOK);
+
+        /// No watch event fired and the watch survives: the node was never deleted
+        ASSERT_FALSE(response_queue.tryPop(r));
+        ASSERT_EQ(machine.getStore().getTotalWatchesCount(), watches_before + 1);
     }
 
     machine.shutdown();
