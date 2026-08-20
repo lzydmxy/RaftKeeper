@@ -28,7 +28,7 @@ def started_cluster():
 
 
 def start(node):
-    node.start_raftkeeper(start_wait=True)
+    node.start_raftkeeper(start_wait=False)
 
 
 def test_node_replace(started_cluster):

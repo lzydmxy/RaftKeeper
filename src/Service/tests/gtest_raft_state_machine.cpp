@@ -662,3 +662,432 @@ TEST(RaftStateMachine, MultiReadAuthCheckPerSubrequest)
     cleanDirectory(snap_dir);
     cleanDirectory(log_dir);
 }
+
+TEST(RaftStateMachine, RemoveRecursive)
+{
+    String snap_dir(SNAP_DIR + "/rem_rec");
+    String log_dir(LOG_DIR + "/rem_rec");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+
+    /// Build: /a -> /a/b, /a/b/c, /a/d
+    setNode(machine.getStore(), "a", "root", false, session_id);
+    setNode(machine.getStore(), "a/b", "child_b", false, session_id);
+    setNode(machine.getStore(), "a/b/c", "grandchild", false, session_id);
+    setNode(machine.getStore(), "a/d", "child_d", false, session_id);
+    ASSERT_TRUE(machine.getStore().getNode("/a") != nullptr);
+    ASSERT_TRUE(machine.getStore().getNode("/a/b/c") != nullptr);
+
+    /// Record parent (/) child count before removal
+    auto root_before = machine.getStore().getNode("/");
+    int32_t root_children_before = root_before->stat.numChildren;
+
+    auto req = cs_new<ZooKeeperRemoveRecursiveRequest>();
+    req->path = "/a";
+    req->xid = 1;
+
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(
+        response_queue, {req, session_id, time}, {}, true, false);
+
+    ASSERT_EQ(machine.getStore().getNode("/a"), nullptr);
+    ASSERT_EQ(machine.getStore().getNode("/a/b"), nullptr);
+    ASSERT_EQ(machine.getStore().getNode("/a/b/c"), nullptr);
+    ASSERT_EQ(machine.getStore().getNode("/a/d"), nullptr);
+
+    /// Parent stat must reflect the removed child (regression: issue #1)
+    auto root_after = machine.getStore().getNode("/");
+    ASSERT_EQ(root_after->stat.numChildren, root_children_before - 1);
+
+    ResponseForSession r;
+    ASSERT_TRUE(response_queue.tryPop(r));
+    ASSERT_EQ(r.response->error, Error::ZOK);
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, TryRemove)
+{
+    String snap_dir(SNAP_DIR + "/tryrem");
+    String log_dir(LOG_DIR + "/tryrem");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+    setNode(machine.getStore(), "exists_node", "data", false, session_id);
+
+    /// TryRemove existing node
+    {
+        auto req = cs_new<ZooKeeperRemoveRequest>();
+        req->path = "/exists_node";
+        req->try_remove = true;
+        req->xid = 1;
+
+        KeeperStore::KeeperResponsesQueue response_queue;
+        int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+        machine.getStore().processRequest(response_queue, {req, session_id, time}, {}, true, false);
+
+        ResponseForSession r;
+        ASSERT_TRUE(response_queue.tryPop(r));
+        ASSERT_EQ(r.response->error, Error::ZOK);
+        ASSERT_EQ(machine.getStore().getNode("/exists_node"), nullptr);
+    }
+
+    /// TryRemove nonexistent — succeeds
+    {
+        auto req = cs_new<ZooKeeperRemoveRequest>();
+        req->path = "/nonexistent";
+        req->try_remove = true;
+        req->xid = 2;
+
+        /// Register a data watch on the missing node, then verify TryRemove
+        /// on a nonexistent path does NOT fire it.
+        uint64_t watches_before = machine.getStore().getTotalWatchesCount();
+        {
+            /// Exists (unlike Get) registers a data watch even on a missing path
+            auto exists_req = cs_new<ZooKeeperExistsRequest>();
+            exists_req->path = "/nonexistent";
+            exists_req->has_watch = true;
+            exists_req->xid = 3;
+
+            KeeperStore::KeeperResponsesQueue watch_queue;
+            int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+            machine.getStore().processRequest(watch_queue, {exists_req, session_id, time}, {}, true, false);
+            ResponseForSession reg;
+            ASSERT_TRUE(watch_queue.tryPop(reg));
+        }
+        ASSERT_EQ(machine.getStore().getTotalWatchesCount(), watches_before + 1);
+
+        KeeperStore::KeeperResponsesQueue response_queue;
+        int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+        machine.getStore().processRequest(response_queue, {req, session_id, time}, {}, true, false);
+
+        ResponseForSession r;
+        ASSERT_TRUE(response_queue.tryPop(r));
+        ASSERT_EQ(r.response->error, Error::ZOK);
+
+        /// No watch event fired and the watch survives: the node was never deleted
+        ASSERT_FALSE(response_queue.tryPop(r));
+        ASSERT_EQ(machine.getStore().getTotalWatchesCount(), watches_before + 1);
+    }
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, CheckStat)
+{
+    String snap_dir(SNAP_DIR + "/chkstat");
+    String log_dir(LOG_DIR + "/chkstat");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+    setNode(machine.getStore(), "check_node", "data", false, session_id);
+
+    auto node = machine.getStore().getNode("/check_node");
+    int32_t v = node->stat.version;
+    int32_t cv = node->stat.cversion;
+    int32_t av = node->stat.aversion;
+
+    /// Matching stat
+    {
+        auto req = cs_new<ZooKeeperCheckStatRequest>();
+        req->path = "/check_node";
+        req->version = v;
+        req->cversion = cv;
+        req->aversion = av;
+        req->xid = 1;
+
+        KeeperStore::KeeperResponsesQueue response_queue;
+        int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+        machine.getStore().processRequest(response_queue, {req, session_id, time}, {}, true, false);
+
+        ResponseForSession r;
+        ASSERT_TRUE(response_queue.tryPop(r));
+        ASSERT_EQ(r.response->error, Error::ZOK);
+    }
+
+    /// Wrong version
+    {
+        auto req = cs_new<ZooKeeperCheckStatRequest>();
+        req->path = "/check_node";
+        req->version = v + 1;
+        req->cversion = -1;
+        req->aversion = -1;
+        req->xid = 2;
+
+        KeeperStore::KeeperResponsesQueue response_queue;
+        int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+        machine.getStore().processRequest(response_queue, {req, session_id, time}, {}, true, false);
+
+        ResponseForSession r;
+        ASSERT_TRUE(response_queue.tryPop(r));
+        ASSERT_EQ(r.response->error, Error::ZBADVERSION);
+    }
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, ListRecursive)
+{
+    String snap_dir(SNAP_DIR + "/listrec");
+    String log_dir(LOG_DIR + "/listrec");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+
+    /// Build: /subtree -> /subtree/x, /subtree/y, /subtree/y/z
+    setNode(machine.getStore(), "subtree", "root", false, session_id);
+    setNode(machine.getStore(), "subtree/x", "x_data", false, session_id);
+    setNode(machine.getStore(), "subtree/y", "y_data", false, session_id);
+    setNode(machine.getStore(), "subtree/y/z", "z_data", false, session_id);
+
+    auto req = cs_new<ZooKeeperListRecursiveRequest>();
+    req->path = "/subtree";
+    req->xid = 1;
+
+    /// ListRecursive is read-only: zxid must not advance (regression: issue #2)
+    int64_t zxid_before = machine.getStore().getZxid();
+
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(response_queue, {req, session_id, time}, {}, true, false);
+
+    ASSERT_EQ(machine.getStore().getZxid(), zxid_before);
+
+    ResponseForSession r;
+    ASSERT_TRUE(response_queue.tryPop(r));
+    ASSERT_EQ(r.response->error, Error::ZOK);
+
+    auto & list_resp = dynamic_cast<ZooKeeperListRecursiveResponse &>(*r.response);
+    std::vector<String> names;
+    for (auto it = list_resp.names.begin(); it != list_resp.names.end(); ++it)
+        names.emplace_back(*it);
+    std::sort(names.begin(), names.end());
+    ASSERT_EQ(names.size(), 3u);
+    ASSERT_EQ(names[0], "/subtree/x");
+    ASSERT_EQ(names[1], "/subtree/y");
+    ASSERT_EQ(names[2], "/subtree/y/z");
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, FilteredListWithStatsAndData)
+{
+    String snap_dir(SNAP_DIR + "/flist_stats");
+    String log_dir(LOG_DIR + "/flist_stats");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+
+    setNode(machine.getStore(), "flist", "root", false, session_id);
+    setNode(machine.getStore(), "flist/x", "data_x", false, session_id);
+    setNode(machine.getStore(), "flist/y", "data_y", false, session_id);
+
+    auto req = cs_new<ZooKeeperFilteredListRequest>();
+    req->path = "/flist";
+    req->xid = 1;
+    req->list_with_stats_and_data = true;
+    req->with_stat = true;
+    req->with_data = true;
+    ASSERT_EQ(req->getOpNum(), OpNum::FilteredListWithStatsAndData);
+
+    int64_t zxid_before = machine.getStore().getZxid();
+
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(response_queue, {req, session_id, time}, {}, true, false);
+
+    ASSERT_EQ(machine.getStore().getZxid(), zxid_before);
+
+    ResponseForSession r;
+    ASSERT_TRUE(response_queue.tryPop(r));
+    ASSERT_EQ(r.response->error, Error::ZOK);
+
+    auto & resp = dynamic_cast<ZooKeeperFilteredListWithStatsAndDataResponse &>(*r.response);
+    ASSERT_EQ(resp.names.size(), 2u);
+    ASSERT_EQ(resp.stats.size(), 2u);
+    ASSERT_EQ(resp.data.size(), 2u);
+
+    size_t i = 0;
+    for (auto it = resp.names.begin(); it != resp.names.end(); ++it, ++i)
+    {
+        String name = (*it).toString();
+        if (name == "x")
+            ASSERT_EQ(resp.data[i], "data_x");
+        else if (name == "y")
+            ASSERT_EQ(resp.data[i], "data_y");
+        else
+            FAIL() << "unexpected child " << name;
+    }
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, MultiWriteWithCheckStatAndTryRemove)
+{
+    String snap_dir(SNAP_DIR + "/multi_checkstat_tryremove");
+    String log_dir(LOG_DIR + "/multi_checkstat_tryremove");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+
+    setNode(machine.getStore(), "mnode", "data", false, session_id);
+    auto node = machine.getStore().getNode("/mnode");
+    int32_t ver = node->stat.version;
+
+    /// Multi (write): CheckStat(correct version) + TryRemove(existing) must both succeed.
+    auto multi = cs_new<ZooKeeperMultiRequest>();
+    multi->operation_type = ZooKeeperMultiRequest::OperationType::Write;
+    multi->xid = 10;
+    {
+        auto cs = cs_new<ZooKeeperCheckStatRequest>();
+        cs->path = "/mnode";
+        cs->version = ver;
+        cs->cversion = -1;
+        cs->aversion = -1;
+        multi->requests.push_back(cs);
+    }
+    {
+        auto tr = cs_new<ZooKeeperRemoveRequest>();
+        tr->path = "/mnode";
+        tr->try_remove = true;
+        tr->version = -1;
+        multi->requests.push_back(tr);
+    }
+
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(response_queue, {multi, session_id, time}, {}, true, false);
+
+    ResponseForSession r;
+    ASSERT_TRUE(response_queue.tryPop(r));
+    auto & multi_resp = dynamic_cast<ZooKeeperMultiResponse &>(*r.response);
+    ASSERT_EQ(multi_resp.responses.size(), 2u);
+    ASSERT_EQ(multi_resp.responses[0]->error, Error::ZOK);
+    ASSERT_EQ(multi_resp.responses[1]->error, Error::ZOK);
+    /// Node removed by the TryRemove sub-op
+    ASSERT_EQ(machine.getStore().getNode("/mnode"), nullptr);
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, MultiRemoveRecursiveRollback)
+{
+    String snap_dir(SNAP_DIR + "/multi_remrec_rollback");
+    String log_dir(LOG_DIR + "/multi_remrec_rollback");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+
+    /// Build subtree /r -> /r/a, /r/a/b, /r/c
+    setNode(machine.getStore(), "r", "root", false, session_id);
+    setNode(machine.getStore(), "r/a", "a_data", false, session_id);
+    setNode(machine.getStore(), "r/a/b", "b_data", false, session_id);
+    setNode(machine.getStore(), "r/c", "c_data", false, session_id);
+
+    auto root_parent = machine.getStore().getNode("/");
+    int32_t parent_children_before = root_parent->stat.numChildren;
+
+    /// Multi (write): RemoveRecursive(/r) then a Check that FAILS (wrong version on a
+    /// node that no longer needs to exist) -> whole multi must roll back, restoring /r.
+    auto multi = cs_new<ZooKeeperMultiRequest>();
+    multi->operation_type = ZooKeeperMultiRequest::OperationType::Write;
+    multi->xid = 20;
+    {
+        auto rr = cs_new<ZooKeeperRemoveRecursiveRequest>();
+        rr->path = "/r";
+        multi->requests.push_back(rr);
+    }
+    {
+        /// Check on a nonexistent path -> ZNONODE -> triggers rollback
+        auto ck = cs_new<ZooKeeperCheckRequest>();
+        ck->path = "/does_not_exist";
+        ck->version = -1;
+        multi->requests.push_back(ck);
+    }
+
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(response_queue, {multi, session_id, time}, {}, true, false);
+
+    ResponseForSession r;
+    ASSERT_TRUE(response_queue.tryPop(r));
+    /// Multi failed, so the whole subtree must be restored intact.
+    ASSERT_NE(machine.getStore().getNode("/r"), nullptr);
+    ASSERT_NE(machine.getStore().getNode("/r/a"), nullptr);
+    ASSERT_NE(machine.getStore().getNode("/r/a/b"), nullptr);
+    ASSERT_NE(machine.getStore().getNode("/r/c"), nullptr);
+    /// Data preserved
+    ASSERT_EQ(machine.getStore().getNode("/r/a/b")->data, "b_data");
+    /// Parent link + stat restored
+    ASSERT_TRUE(machine.getStore().getNode("/")->children.count("r") == 1);
+    ASSERT_EQ(machine.getStore().getNode("/")->stat.numChildren, parent_children_before);
+    /// /r still has both children
+    ASSERT_EQ(machine.getStore().getNode("/r")->children.size(), 2u);
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}

@@ -46,6 +46,11 @@ enum class OpNum : int32_t
     FilteredList = 500,
     CheckNotExists = 501,
     CreateIfNotExists = 502,
+    RemoveRecursive = 503,
+    CheckStat = 504,
+    TryRemove = 505,
+    FilteredListWithStatsAndData = 506,
+    ListRecursive = 507,
 
     UpdateSession = 998, /// Special internal request. Used to session reconnect.
 };

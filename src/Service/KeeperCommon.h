@@ -34,6 +34,11 @@ using ThreadPoolPtr = std::shared_ptr<ThreadPool>;
         MULTI_READ,
         CHECK_NOT_EXISTS,
         CREATE_IF_NOT_EXISTS,
+        REMOVE_RECURSIVE,
+        CHECK_STAT,
+        TRY_REMOVE,
+        LIST_WITH_STAT_AND_DATA,
+        GET_CHILDREN_RECURSIVE,
         MAX,
     };
 
@@ -60,9 +65,10 @@ using ThreadPoolPtr = std::shared_ptr<ThreadPool>;
     };
 
     inline constexpr auto CURRENT_KEEPER_API_VERSION = KeeperApiVersion::WITH_MULTI_READ;
-    // 0b11110000 enable FILTERED_LIST & MULTI_READ & CHECK_NOT_EXISTS & CREATE_IF_NOT_EXISTS,
-    // For example, set 0b10110000 to disable MULTI_READ
-    inline const std::string CURRENT_KEEPER_FEATURE_FLAGS = "\xF0";
+    // 0b11111111 0b10000000 enable all 9 feature flags:
+    // FILTERED_LIST, MULTI_READ, CHECK_NOT_EXISTS, CREATE_IF_NOT_EXISTS,
+    // REMOVE_RECURSIVE, CHECK_STAT, TRY_REMOVE, LIST_WITH_STAT_AND_DATA, GET_CHILDREN_RECURSIVE
+    inline const std::string CURRENT_KEEPER_FEATURE_FLAGS = "\xFF\x80";
 #endif
 
 struct RequestId;

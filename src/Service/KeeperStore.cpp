@@ -120,7 +120,8 @@ static bool shouldIncreaseZxid(const Coordination::ZooKeeperRequestPtr & zk_requ
         || dynamic_cast<Coordination::ZooKeeperHeartbeatRequest *>(zk_request.get())
         || dynamic_cast<Coordination::ZooKeeperListRequest *>(zk_request.get())
         || dynamic_cast<Coordination::ZooKeeperSimpleListRequest *>(zk_request.get())
-        || zk_request->getOpNum() == Coordination::OpNum::MultiRead);
+        || zk_request->getOpNum() == Coordination::OpNum::MultiRead
+        || zk_request->getOpNum() == Coordination::OpNum::ListRecursive);
 }
 
 KeeperNodePtr KeeperNode::clone() const
@@ -455,6 +456,11 @@ struct StoreRequestRemove final : public StoreRequest
 {
     using StoreRequest::StoreRequest;
 
+    /// Filled by process(): true only when a node was actually removed.
+    /// TryRemove returns ZOK even for a missing node, so watch firing must
+    /// check this (mirrors RemoveRecursive::removed_paths).
+    mutable bool removed = false;
+
     bool checkAuth(KeeperStore & store, int64_t session_id) const override
     {
         auto parent = store.getNode(getParentPath(zk_request->getPath()));
@@ -493,7 +499,10 @@ struct StoreRequestRemove final : public StoreRequest
         auto node = store.getNode(request.path);
         if (node == nullptr)
         {
-            response.error = Coordination::Error::ZNONODE;
+            if (request.try_remove)
+                response.error = Coordination::Error::ZOK;
+            else
+                response.error = Coordination::Error::ZNONODE;
         }
         else if (request.version != -1 && request.version != node->stat.version)
         {
@@ -544,9 +553,232 @@ struct StoreRequestRemove final : public StoreRequest
                     undo_parent->children.insert(child_basename);
                 }
             };
+            removed = true;
         }
 
         return {response_ptr, undo};
+    }
+};
+
+struct StoreRequestRemoveRecursive final : public StoreRequest
+{
+    using StoreRequest::StoreRequest;
+
+    /// Paths actually removed (root + descendants), filled on success so the caller
+    /// can fire a DELETED watch for each. Recursive delete touches many nodes, but
+    /// watch firing is centralized in processRequest which only sees the root path.
+    mutable std::vector<String> removed_paths;
+
+    bool checkAuth(KeeperStore & store, int64_t session_id) const override
+    {
+        auto parent = store.getNode(getParentPath(zk_request->getPath()));
+        if (parent == nullptr)
+            return true;
+
+        const auto & node_acls = store.acl_map.convertNumber(parent->acl_id);
+        if (node_acls.empty())
+            return true;
+
+        std::shared_lock r_lock(store.auth_mutex);
+        auto it = store.session_and_auth.find(session_id);
+        const auto & session_auths = (it != store.session_and_auth.end()) ? it->second : std::vector<Coordination::AuthID>{};
+        return checkACL(Coordination::ACL::Delete, node_acls, session_auths);
+    }
+
+    std::pair<Coordination::ZooKeeperResponsePtr, Undo>
+    process(KeeperStore & store, int64_t zxid, int64_t /*session_id*/, int64_t /* time */) const override
+    {
+        auto response = zk_request->makeResponse();
+        auto & request_typed = dynamic_cast<Coordination::ZooKeeperRemoveRecursiveRequest &>(*zk_request);
+        auto & response_typed = dynamic_cast<Coordination::ZooKeeperRemoveRecursiveResponse &>(*response);
+
+        auto root_node = store.getNode(request_typed.path);
+        if (root_node == nullptr)
+        {
+            response_typed.error = Coordination::Error::ZNONODE;
+            return {response, {}};
+        }
+
+        /// Collect all descendant paths via DFS
+        std::vector<String> paths_to_remove;
+        paths_to_remove.push_back(request_typed.path);
+        std::function<void(const KeeperNodePtr &, const String &)> collect_descendants
+            = [&](const KeeperNodePtr & node, const String & node_path)
+        {
+            for (const auto & child : node->children)
+            {
+                String child_path = node_path + "/" + child;
+                auto child_node = store.getNode(child_path);
+                if (child_node)
+                {
+                    paths_to_remove.push_back(child_path);
+                    if (!child_node->children.empty())
+                        collect_descendants(child_node, child_path);
+                }
+            }
+        };
+        collect_descendants(root_node, request_typed.path);
+
+        /// Check limit
+        if (request_typed.remove_nodes_limit > 0
+            && paths_to_remove.size() > static_cast<size_t>(request_typed.remove_nodes_limit))
+        {
+            response_typed.error = Coordination::Error::ZNOTEMPTY;
+            return {response, {}};
+        }
+
+        /// Snapshot every node about to be removed so the operation can be rolled back
+        /// (required when RemoveRecursive is a subrequest of a multi transaction).
+        /// clone() preserves each node's own children set, so internal parent-child
+        /// links inside the subtree are restored automatically on re-add; only the
+        /// root's link into its surviving parent must be restored manually.
+        std::vector<std::pair<String, KeeperNodePtr>> removed_nodes;
+        removed_nodes.reserve(paths_to_remove.size());
+        for (const auto & path : paths_to_remove)
+        {
+            if (auto n = store.getNode(path))
+                removed_nodes.emplace_back(path, n->clone());
+        }
+
+        String root_base = getBaseName(request_typed.path);
+        String root_parent_path = getParentPath(request_typed.path);
+        int64_t root_parent_pzxid = 0;
+        bool has_root_parent = false;
+
+        /// Update the surviving parent of the recursive-delete root: its child count
+        /// drops by one and pzxid advances, matching StoreRequestRemove's behaviour.
+        /// (Descendants' parents are themselves removed, so only this parent survives.)
+        if (auto root_parent = store.getNode(root_parent_path))
+        {
+            has_root_parent = true;
+            root_parent_pzxid = root_parent->stat.pzxid;
+            --root_parent->stat.numChildren;
+            root_parent->stat.pzxid = zxid;
+        }
+
+        /// Remove from leaves up. Each node is removed individually via KeeperStore public API.
+        for (auto it = paths_to_remove.rbegin(); it != paths_to_remove.rend(); ++it)
+        {
+            const auto & path = *it;
+            auto node = store.getNode(path);
+            if (!node)
+                continue;
+
+            /// Clear from parent's children set
+            auto parent = store.getNode(getParentPath(path));
+            if (parent)
+                parent->children.erase(getBaseName(path));
+
+            /// Clean ephemeral and ACL references
+            if (node->is_ephemeral)
+                store.removeEphemeralNode(node->stat.ephemeralOwner, path);
+            store.acl_map.removeUsage(node->acl_id);
+            store.removeNode(path);
+        }
+
+        response_typed.error = Coordination::Error::ZOK;
+        removed_paths = paths_to_remove;
+
+        Undo undo = [&store, removed_nodes, root_base, root_parent_path, root_parent_pzxid, has_root_parent]
+        {
+            /// Re-add nodes root-first so parents exist before children are relinked.
+            /// Each clone already carries its own children set, so subtree links restore
+            /// automatically; we only relink the root into its surviving parent below.
+            for (const auto & [path, node] : removed_nodes)
+            {
+                store.addNode(path, node);
+                store.acl_map.addUsage(node->acl_id);
+                if (node->is_ephemeral)
+                    store.addEphemeralNode(node->stat.ephemeralOwner, path);
+            }
+
+            if (has_root_parent)
+            {
+                if (auto root_parent = store.getNode(root_parent_path))
+                {
+                    root_parent->children.insert(root_base);
+                    ++root_parent->stat.numChildren;
+                    root_parent->stat.pzxid = root_parent_pzxid;
+                }
+            }
+        };
+
+        return {response, undo};
+    }
+};
+
+struct StoreRequestListRecursive final : public StoreRequest
+{
+    using StoreRequest::StoreRequest;
+
+    bool checkAuth(KeeperStore & store, int64_t session_id) const override
+    {
+        return checkACLForNode(store, session_id, zk_request->getPath(), Coordination::ACL::Read);
+    }
+
+    std::pair<Coordination::ZooKeeperResponsePtr, Undo>
+    process(KeeperStore & store, int64_t /*zxid*/, int64_t /*session_id*/, int64_t /* time */) const override
+    {
+        auto response = zk_request->makeResponse();
+        auto & response_typed = dynamic_cast<Coordination::ZooKeeperListRecursiveResponse &>(*response);
+
+        /// ponytail: access path directly from the request, same as other StoreRequest implementations
+        auto & request_typed = dynamic_cast<Coordination::ZooKeeperListRecursiveRequest &>(*zk_request);
+
+        auto node = store.getNode(request_typed.path);
+        if (!node)
+        {
+            response_typed.error = Coordination::Error::ZNONODE;
+            return {response, {}};
+        }
+
+        std::vector<String> all_paths;
+        bool stopped = false;
+
+        std::function<void(const KeeperNodePtr &, const String &)> collect_recursive
+            = [&](const KeeperNodePtr & current, const String & current_path)
+        {
+            for (const auto & child : current->children)
+            {
+                if (stopped)
+                    return;
+
+                String child_path = current_path + "/" + child;
+                all_paths.push_back(child_path);
+
+                if (request_typed.max_entries > 0
+                    && all_paths.size() >= static_cast<size_t>(request_typed.max_entries))
+                {
+                    stopped = true;
+                    return;
+                }
+
+                auto child_node = store.getNode(child_path);
+                if (child_node && !child_node->children.empty())
+                    collect_recursive(child_node, child_path);
+            }
+        };
+
+        collect_recursive(node, request_typed.path);
+
+        response_typed.names.push_back(all_paths.begin(), all_paths.end());
+        response_typed.error = Coordination::Error::ZOK;
+        return {response, {}};
+    }
+
+private:
+    static bool checkACLForNode(KeeperStore & store, int64_t session_id, const String & path, int32_t permission)
+    {
+        auto node = store.getNode(path);
+        if (!node)
+            return true;
+        const auto & node_acls = store.acl_map.convertNumber(node->acl_id);
+        if (node_acls.empty())
+            return true;
+        std::shared_lock r_lock(store.auth_mutex);
+        auto it = store.session_and_auth.find(session_id);
+        const auto & session_auths = (it != store.session_and_auth.end()) ? it->second : std::vector<Coordination::AuthID>{};
+        return checkACL(permission, node_acls, session_auths);
     }
 };
 
@@ -690,30 +922,33 @@ struct StoreRequestList final : public StoreRequest
         if (path_prefix.empty())
             throw RK::Exception(ErrorCodes::LOGICAL_ERROR, "Logical error: path cannot be empty");
 
-        if (response->getOpNum() == Coordination::OpNum::List || response->getOpNum() == Coordination::OpNum::FilteredList)
+        if (response->getOpNum() == Coordination::OpNum::List
+            || response->getOpNum() == Coordination::OpNum::FilteredList
+            || response->getOpNum() == Coordination::OpNum::FilteredListWithStatsAndData)
         {
             using enum Coordination::ZooKeeperFilteredListRequest::ListRequestType;
             auto list_request_type = ALL;
+            bool with_stat = false;
+            bool with_data = false;
             if (auto * filtered_list_request = dynamic_cast<Coordination::ZooKeeperFilteredListRequest *>(&request_typed))
             {
                 list_request_type = filtered_list_request->list_request_type;
+                with_stat = filtered_list_request->with_stat;
+                with_data = filtered_list_request->with_data;
             }
 
-            auto & response_typed = dynamic_cast<Coordination::ZooKeeperListResponse &>(*response);
+            /// Cast to the ListResponse base: for OpNum 506 the concrete type is
+            /// ZooKeeperFilteredListWithStatsAndDataResponse, which is NOT a ZooKeeperListResponse.
+            auto & response_typed = dynamic_cast<Coordination::ListResponse &>(*response);
 
             response_typed.stat = node->statForResponse();
 
-            if (list_request_type == ALL)
+            auto matches_filter = [&](const auto & child) -> bool
             {
-                response_typed.names.reserve(node->children.size());
-                response_typed.names.push_back(node->children.begin(), node->children.end());
-                return {response, {}};
-            }
-
-            auto add_child = [&](const auto & child)
-            {
+                if (list_request_type == ALL)
+                    return true;
                 auto child_node = store.getNode(request_typed.path + "/" + child);
-                if (node == nullptr)
+                if (child_node == nullptr)
                 {
                     LOG_ERROR(
                         &Poco::Logger::get("StoreRequestList"),
@@ -722,15 +957,26 @@ struct StoreRequestList final : public StoreRequest
                         request_typed.path);
                     std::terminate();
                 }
-
                 const auto is_ephemeral = child_node->stat.ephemeralOwner != 0;
                 return (is_ephemeral && list_request_type == EPHEMERAL_ONLY) || (!is_ephemeral && list_request_type == PERSISTENT_ONLY);
             };
 
-            for (const auto & child: node->children)
+            response_typed.names.reserve(node->children.size());
+            for (const auto & child : node->children)
             {
-                if (add_child(child))
-                    response_typed.names.push_back(child);
+                if (!matches_filter(child))
+                    continue;
+
+                response_typed.names.push_back(child);
+
+                if (with_stat || with_data)
+                {
+                    auto child_node = store.getNode(request_typed.path + "/" + child);
+                    if (with_stat)
+                        response_typed.stats.push_back(child_node ? child_node->statForResponse() : Coordination::Stat{});
+                    if (with_data)
+                        response_typed.data.push_back(child_node ? child_node->data : String{});
+                }
             }
         }
         else
@@ -813,6 +1059,48 @@ struct StoreRequestCheck final : public StoreRequest
 
 private:
     bool check_not_exists;
+};
+
+struct StoreRequestCheckStat final : public StoreRequest
+{
+    using StoreRequest::StoreRequest;
+
+    bool checkAuth(KeeperStore & store, int64_t session_id) const override
+    {
+        auto node = store.getNode(zk_request->getPath());
+        if (node == nullptr)
+            return true;
+
+        const auto & node_acls = store.acl_map.convertNumber(node->acl_id);
+        if (node_acls.empty())
+            return true;
+
+        std::shared_lock r_lock(store.auth_mutex);
+        auto it = store.session_and_auth.find(session_id);
+        const auto & session_auths = (it != store.session_and_auth.end()) ? it->second : std::vector<Coordination::AuthID>{};
+        return checkACL(Coordination::ACL::Read, node_acls, session_auths);
+    }
+
+    std::pair<Coordination::ZooKeeperResponsePtr, Undo>
+    process(KeeperStore & store, int64_t /*zxid*/, int64_t /*session_id*/, int64_t /* time */) const override
+    {
+        auto response = zk_request->makeResponse();
+        auto & request_typed = dynamic_cast<Coordination::ZooKeeperCheckStatRequest &>(*zk_request);
+
+        auto node = store.getNode(request_typed.path);
+        if (node == nullptr)
+            response->error = Coordination::Error::ZNONODE;
+        else if (request_typed.version != -1 && request_typed.version != node->stat.version)
+            response->error = Coordination::Error::ZBADVERSION;
+        else if (request_typed.cversion != -1 && request_typed.cversion != node->stat.cversion)
+            response->error = Coordination::Error::ZBADVERSION;
+        else if (request_typed.aversion != -1 && request_typed.aversion != node->stat.aversion)
+            response->error = Coordination::Error::ZBADVERSION;
+        else
+            response->error = Coordination::Error::ZOK;
+
+        return {response, {}};
+    }
 };
 
 struct StoreRequestSetACL final : public StoreRequest
@@ -1015,7 +1303,8 @@ struct StoreRequestMultiTxn final : public StoreRequest
                 check_operation_type(OperationType::Write);
                 concrete_requests.push_back(std::make_shared<StoreRequestCreate>(sub_zk_request));
             }
-            else if (sub_zk_request->getOpNum() == Coordination::OpNum::Remove)
+            else if (sub_zk_request->getOpNum() == Coordination::OpNum::Remove
+                     || sub_zk_request->getOpNum() == Coordination::OpNum::TryRemove)
             {
                 check_operation_type(OperationType::Write);
                 concrete_requests.push_back(std::make_shared<StoreRequestRemove>(sub_zk_request));
@@ -1029,6 +1318,16 @@ struct StoreRequestMultiTxn final : public StoreRequest
             {
                 check_operation_type(OperationType::Write);
                 concrete_requests.push_back(std::make_shared<StoreRequestCheck>(sub_zk_request));
+            }
+            else if (sub_zk_request->getOpNum() == Coordination::OpNum::CheckStat)
+            {
+                check_operation_type(OperationType::Write);
+                concrete_requests.push_back(std::make_shared<StoreRequestCheckStat>(sub_zk_request));
+            }
+            else if (sub_zk_request->getOpNum() == Coordination::OpNum::RemoveRecursive)
+            {
+                check_operation_type(OperationType::Write);
+                concrete_requests.push_back(std::make_shared<StoreRequestRemoveRecursive>(sub_zk_request));
             }
             else if (sub_zk_request->getOpNum() == Coordination::OpNum::Get)
             {
@@ -1221,6 +1520,11 @@ StoreRequestFactory::StoreRequestFactory()
     registerNuKeeperRequestWrapper<Coordination::OpNum::GetACL, StoreRequestGetACL>(*this);
     registerNuKeeperRequestWrapper<Coordination::OpNum::CheckNotExists, StoreRequestCheck>(*this);
     registerNuKeeperRequestWrapper<Coordination::OpNum::CreateIfNotExists, StoreRequestCreate>(*this);
+    registerNuKeeperRequestWrapper<Coordination::OpNum::RemoveRecursive, StoreRequestRemoveRecursive>(*this);
+    registerNuKeeperRequestWrapper<Coordination::OpNum::CheckStat, StoreRequestCheckStat>(*this);
+    registerNuKeeperRequestWrapper<Coordination::OpNum::TryRemove, StoreRequestRemove>(*this);
+    registerNuKeeperRequestWrapper<Coordination::OpNum::FilteredListWithStatsAndData, StoreRequestList>(*this);
+    registerNuKeeperRequestWrapper<Coordination::OpNum::ListRecursive, StoreRequestListRecursive>(*this);
 }
 
 
@@ -1461,9 +1765,16 @@ void KeeperStore::processRequest(
                     if (!multi_response->responses.empty() && multi_response->responses.back()->error == Coordination::Error::ZOK)
                     {
                         auto * multi_request = dynamic_cast<Coordination::ZooKeeperMultiRequest *>(zk_request.get());
-                        for (auto & concrete_request : multi_request->requests)
+                        const auto * multi_txn = dynamic_cast<const StoreRequestMultiTxn *>(store_request.get());
+                        for (size_t i = 0; i < multi_request->requests.size(); ++i)
                         {
-                            const auto * sub_zk_request = dynamic_cast<Coordination::ZooKeeperRequest *>(concrete_request.get());
+                            const auto * sub_zk_request = dynamic_cast<Coordination::ZooKeeperRequest *>(multi_request->requests[i].get());
+                            /// TryRemove sub-op returns ZOK without deleting a missing
+                            /// node — must not fire a spurious DELETED watch for it.
+                            const auto * sub_remove
+                                = multi_txn ? dynamic_cast<const StoreRequestRemove *>(multi_txn->concrete_requests[i].get()) : nullptr;
+                            if (sub_remove && !sub_remove->removed)
+                                continue;
                             auto watch_responses = watch_manager.processWatches(sub_zk_request->getPath(), sub_zk_request->getOpNum());
                             if (!watch_responses.empty())
                             {
@@ -1475,11 +1786,34 @@ void KeeperStore::processRequest(
                 }
                 else
                 {
-                    auto watch_responses = watch_manager.processWatches(zk_request->getPath(), zk_request->getOpNum());
-                    if (!watch_responses.empty())
+                    /// RemoveRecursive deletes a whole subtree; fire a DELETED watch for
+                    /// every removed node, not just the root (processWatches by opnum only
+                    /// covers the single request path).
+                    if (auto * rr = dynamic_cast<StoreRequestRemoveRecursive *>(store_request.get()))
                     {
-                        LOG_TRACE(log, "{} triggered {} watches", request_for_session.toSimpleString(), watch_responses.size());
-                        set_response(responses_queue, watch_responses, ignore_response);
+                        for (const auto & removed_path : rr->removed_paths)
+                        {
+                            auto watch_responses = watch_manager.processWatches(removed_path, Coordination::Event::DELETED);
+                            if (!watch_responses.empty())
+                                set_response(responses_queue, watch_responses, ignore_response);
+                        }
+                    }
+                    else
+                    {
+                        /// TryRemove succeeds (ZOK) without deleting anything when the
+                        /// node is missing — must not fire a spurious DELETED watch.
+                        const auto * remove_request = dynamic_cast<const StoreRequestRemove *>(store_request.get());
+                        const bool actually_removed = !remove_request || remove_request->removed;
+
+                        if (actually_removed)
+                        {
+                            auto watch_responses = watch_manager.processWatches(zk_request->getPath(), zk_request->getOpNum());
+                            if (!watch_responses.empty())
+                            {
+                                LOG_TRACE(log, "{} triggered {} watches", request_for_session.toSimpleString(), watch_responses.size());
+                                set_response(responses_queue, watch_responses, ignore_response);
+                            }
+                        }
                     }
                 }
             }

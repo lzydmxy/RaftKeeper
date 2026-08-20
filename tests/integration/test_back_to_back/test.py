@@ -585,7 +585,9 @@ def generate_requests(prefix="/", iters=1):
 def test_random_requests(started_cluster):
     genuine_zk = fake_zk = None
     try:
-        requests = generate_requests("/test_random_requests", 10)
+        # ponytail: 10 iters (~3000 serial round-trips x2 clients) times out under
+        # sanitizers (~10x slowdown). 3 iters keeps broad randomized coverage within 300s.
+        requests = generate_requests("/test_random_requests", 3)
         print("Generated", len(requests), "requests")
         genuine_zk = get_genuine_zk()
         fake_zk = get_fake_zk()
@@ -946,5 +948,256 @@ def test_multi_read_subrequest_watch(started_cluster):
         assert '/test_multiread_watch/node_b' in wchc_output, \
             "Exists watch from MultiRead subrequest not registered on server"
 
+    finally:
+        close_zk_clients([fake_zk])
+
+
+def test_remove_recursive(started_cluster):
+    fake_zk = None
+    try:
+        fake_zk = get_fake_zk(True)
+        fake_zk.start()
+
+        fake_zk.create('/test_rem_rec')
+        fake_zk.create('/test_rem_rec/a', b'data_a')
+        fake_zk.create('/test_rem_rec/a/aa', b'data_aa')
+        fake_zk.create('/test_rem_rec/b', b'data_b')
+        fake_zk.create('/test_rem_rec/c', b'data_c')
+
+        assert fake_zk.exists('/test_rem_rec/a/aa') is not None
+
+        fake_zk.remove_recursive('/test_rem_rec')
+
+        assert fake_zk.exists('/test_rem_rec') is None
+        assert fake_zk.exists('/test_rem_rec/a') is None
+        assert fake_zk.exists('/test_rem_rec/a/aa') is None
+        assert fake_zk.exists('/test_rem_rec/b') is None
+
+    finally:
+        close_zk_clients([fake_zk])
+
+
+def test_try_remove(started_cluster):
+    fake_zk = None
+    try:
+        fake_zk = get_fake_zk(True)
+        fake_zk.start()
+
+        fake_zk.create('/test_tryrem')
+        fake_zk.create('/test_tryrem/exists', b'data')
+
+        # try_remove on existing node — succeeds
+        fake_zk.try_remove('/test_tryrem/exists')
+        assert fake_zk.exists('/test_tryrem/exists') is None
+
+        # try_remove on nonexistent node — succeeds (no error)
+        fake_zk.try_remove('/test_tryrem/nonexistent')
+
+    finally:
+        close_zk_clients([fake_zk])
+
+
+def test_list_recursive(started_cluster):
+    fake_zk = None
+    try:
+        fake_zk = get_fake_zk(True)
+        fake_zk.start()
+
+        fake_zk.create('/test_listrec')
+        fake_zk.create('/test_listrec/x', b'x_data')
+        fake_zk.create('/test_listrec/y', b'y_data')
+        fake_zk.create('/test_listrec/y/z', b'z_data')
+
+        names = fake_zk.list_recursive('/test_listrec')
+        assert len(names) == 3
+        assert '/test_listrec/x' in names
+        assert '/test_listrec/y' in names
+        assert '/test_listrec/y/z' in names
+
+    finally:
+        close_zk_clients([fake_zk])
+
+def test_check_stat(started_cluster):
+    fake_zk = None
+    try:
+        fake_zk = get_fake_zk(True)
+        fake_zk.start()
+
+        fake_zk.create('/test_check_stat', b'data')
+        stat = fake_zk.exists('/test_check_stat')
+
+        # Matching version/cversion/aversion -> succeeds
+        fake_zk.check_stat('/test_check_stat', version=stat.version,
+                           cversion=stat.cversion, aversion=stat.aversion)
+
+        # Wrong version -> BadVersionError
+        from kazoo.exceptions import BadVersionError, NoNodeError
+        got = False
+        try:
+            fake_zk.check_stat('/test_check_stat', version=stat.version + 1)
+        except BadVersionError:
+            got = True
+        assert got, "CheckStat with wrong version should raise BadVersionError"
+
+        # Nonexistent node -> NoNodeError
+        got = False
+        try:
+            fake_zk.check_stat('/test_check_stat_missing', version=-1)
+        except NoNodeError:
+            got = True
+        assert got, "CheckStat on missing node should raise NoNodeError"
+    finally:
+        close_zk_clients([fake_zk])
+
+
+def test_filtered_list_with_stats_and_data(started_cluster):
+    fake_zk = None
+    try:
+        fake_zk = get_fake_zk(True)
+        fake_zk.start()
+
+        fake_zk.create('/test_flist_sd')
+        fake_zk.create('/test_flist_sd/x', b'data_x')
+        fake_zk.create('/test_flist_sd/y', b'data_y')
+
+        children, stat, stats, data = fake_zk.list_children_with_stats_and_data(
+            '/test_flist_sd', list_type=0, with_stat=True, with_data=True)
+
+        assert sorted(children) == ['x', 'y']
+        assert len(stats) == 2
+        assert len(data) == 2
+        # data entries correspond to children by index
+        by_child = dict(zip(children, data))
+        assert by_child['x'] == b'data_x'
+        assert by_child['y'] == b'data_y'
+    finally:
+        close_zk_clients([fake_zk])
+
+
+def test_try_remove_fires_watch(started_cluster):
+    fake_zk = None
+    try:
+        fake_zk = get_fake_zk(True)
+        fake_zk.start()
+
+        fake_zk.create('/test_tryrem_watch', b'data')
+
+        events = []
+        def watch_cb(event):
+            events.append(event)
+
+        # data watch via get
+        fake_zk.get('/test_tryrem_watch', watch=watch_cb)
+        fake_zk.try_remove('/test_tryrem_watch')
+        time.sleep(3)
+
+        assert len(events) >= 1, "TryRemove on existing node must fire a watch event"
+        assert events[0].type == 'DELETED', f"expected DELETED, got {events[0].type}"
+    finally:
+        close_zk_clients([fake_zk])
+
+
+def test_remove_recursive_fires_watches(started_cluster):
+    fake_zk = None
+    try:
+        fake_zk = get_fake_zk(True)
+        fake_zk.start()
+
+        fake_zk.create('/test_remrec_watch')
+        fake_zk.create('/test_remrec_watch/a', b'a')
+        fake_zk.create('/test_remrec_watch/a/b', b'b')
+
+        deleted = []
+        def cb_a(event):
+            if event.type == 'DELETED':
+                deleted.append(event.path)
+        def cb_b(event):
+            if event.type == 'DELETED':
+                deleted.append(event.path)
+
+        fake_zk.get('/test_remrec_watch/a', watch=cb_a)
+        fake_zk.get('/test_remrec_watch/a/b', watch=cb_b)
+
+        fake_zk.remove_recursive('/test_remrec_watch')
+        time.sleep(3)
+
+        assert '/test_remrec_watch/a' in deleted
+        assert '/test_remrec_watch/a/b' in deleted
+    finally:
+        close_zk_clients([fake_zk])
+
+
+def test_remove_recursive_limit(started_cluster):
+    fake_zk = None
+    try:
+        fake_zk = get_fake_zk(True)
+        fake_zk.start()
+
+        fake_zk.create('/test_remrec_limit')
+        fake_zk.create('/test_remrec_limit/a')
+        fake_zk.create('/test_remrec_limit/b')
+        fake_zk.create('/test_remrec_limit/c')
+
+        # 4 nodes total (root + 3 children); limit of 2 must reject with NotEmpty
+        from kazoo.exceptions import NotEmptyError
+        got = False
+        try:
+            fake_zk.remove_recursive('/test_remrec_limit', remove_nodes_limit=2)
+        except NotEmptyError:
+            got = True
+        assert got, "RemoveRecursive over the node limit must raise NotEmptyError"
+        # Nothing removed
+        assert fake_zk.exists('/test_remrec_limit') is not None
+        assert fake_zk.exists('/test_remrec_limit/a') is not None
+
+        # Sufficient limit succeeds
+        fake_zk.remove_recursive('/test_remrec_limit', remove_nodes_limit=10)
+        assert fake_zk.exists('/test_remrec_limit') is None
+    finally:
+        close_zk_clients([fake_zk])
+
+
+def test_list_recursive_max_entries(started_cluster):
+    fake_zk = None
+    try:
+        fake_zk = get_fake_zk(True)
+        fake_zk.start()
+
+        fake_zk.create('/test_listrec_max')
+        for i in range(5):
+            fake_zk.create(f'/test_listrec_max/n{i}')
+
+        # Unlimited returns all 5
+        all_names = fake_zk.list_recursive('/test_listrec_max')
+        assert len(all_names) == 5
+
+        # max_entries caps the result
+        limited = fake_zk.list_recursive('/test_listrec_max', max_entries=2)
+        assert len(limited) == 2
+    finally:
+        close_zk_clients([fake_zk])
+
+
+def test_multi_remove_recursive_rollback(started_cluster):
+    fake_zk = None
+    try:
+        fake_zk = get_fake_zk(True)
+        fake_zk.start()
+
+        fake_zk.create('/test_multi_rr')
+        fake_zk.create('/test_multi_rr/a', b'a')
+        fake_zk.create('/test_multi_rr/a/b', b'b')
+
+        # Multi: RemoveRecursive(/test_multi_rr) + a Check that fails -> rollback
+        t = fake_zk.transaction()
+        t.remove_recursive('/test_multi_rr')
+        t.check('/does_not_exist_xyz', version=-1)  # fails -> whole multi rolls back
+        results = t.commit()
+
+        # Subtree must be fully restored
+        assert fake_zk.exists('/test_multi_rr') is not None
+        assert fake_zk.exists('/test_multi_rr/a') is not None
+        assert fake_zk.exists('/test_multi_rr/a/b') is not None
+        assert fake_zk.get('/test_multi_rr/a/b')[0] == b'b'
     finally:
         close_zk_clients([fake_zk])

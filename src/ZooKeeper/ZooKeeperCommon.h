@@ -263,7 +263,7 @@ struct ZooKeeperRemoveRequest final : RemoveRequest, ZooKeeperRequest
     ZooKeeperRemoveRequest() = default;
     explicit ZooKeeperRemoveRequest(const RemoveRequest & base) : RemoveRequest(base) { }
 
-    OpNum getOpNum() const override { return OpNum::Remove; }
+    OpNum getOpNum() const override { return try_remove ? OpNum::TryRemove : OpNum::Remove; }
     void writeImpl(WriteBuffer & out) const override;
     void readImpl(ReadBuffer & in) override;
 
@@ -278,11 +278,35 @@ struct ZooKeeperRemoveRequest final : RemoveRequest, ZooKeeperRequest
     }
 };
 
-struct ZooKeeperRemoveResponse final : RemoveResponse, ZooKeeperResponse
+struct ZooKeeperRemoveResponse : RemoveResponse, ZooKeeperResponse
 {
     void readImpl(ReadBuffer &) override { }
     void writeImpl(WriteBuffer &) const override { }
     OpNum getOpNum() const override { return OpNum::Remove; }
+};
+
+struct ZooKeeperTryRemoveResponse final : ZooKeeperRemoveResponse
+{
+    OpNum getOpNum() const override { return OpNum::TryRemove; }
+};
+
+struct ZooKeeperRemoveRecursiveRequest final : RemoveRecursiveRequest, ZooKeeperRequest
+{
+    ZooKeeperRemoveRecursiveRequest() = default;
+    explicit ZooKeeperRemoveRecursiveRequest(const RemoveRecursiveRequest & base) : RemoveRecursiveRequest(base) { }
+
+    OpNum getOpNum() const override { return OpNum::RemoveRecursive; }
+    void writeImpl(WriteBuffer & out) const override;
+    void readImpl(ReadBuffer & in) override;
+    ZooKeeperResponsePtr makeResponse() const override;
+    bool isReadRequest() const override { return false; }
+};
+
+struct ZooKeeperRemoveRecursiveResponse final : RemoveRecursiveResponse, ZooKeeperResponse
+{
+    void readImpl(ReadBuffer &) override { }
+    void writeImpl(WriteBuffer &) const override { }
+    OpNum getOpNum() const override { return OpNum::RemoveRecursive; }
 };
 
 struct ZooKeeperExistsRequest final : ExistsRequest, ZooKeeperRequest
@@ -441,10 +465,21 @@ struct ZooKeeperFilteredListRequest final : ZooKeeperListRequest
     }
 
     ListRequestType list_request_type{ListRequestType::ALL};
+    bool with_stat = false;
+    bool with_data = false;
+    /// Set by the request factory for OpNum::FilteredListWithStatsAndData (506).
+    /// Controls whether with_stat/with_data are present on the wire.
+    bool list_with_stats_and_data = false;
 
-    OpNum getOpNum() const override { return OpNum::FilteredList; }
+    OpNum getOpNum() const override
+    {
+        if (list_with_stats_and_data)
+            return OpNum::FilteredListWithStatsAndData;
+        return OpNum::FilteredList;
+    }
     void writeImpl(WriteBuffer & out) const override;
     void readImpl(ReadBuffer & in) override;
+    ZooKeeperResponsePtr makeResponse() const override;
     String toString() const override
     {
         return Coordination::toString(getOpNum()) + ", xid " + std::to_string(xid) + ", path " + path
@@ -478,6 +513,13 @@ struct ZooKeeperListResponse final : ListResponse, ZooKeeperResponse
         std::for_each(names.begin(), names.end(), func);
         return base;
     }
+};
+
+struct ZooKeeperFilteredListWithStatsAndDataResponse final : ListResponse, ZooKeeperResponse
+{
+    void readImpl(ReadBuffer & in) override;
+    void writeImpl(WriteBuffer & out) const override;
+    OpNum getOpNum() const override { return OpNum::FilteredListWithStatsAndData; }
 };
 
 struct ZooKeeperSimpleListResponse final : SimpleListResponse, ZooKeeperResponse
@@ -540,6 +582,51 @@ struct ZooKeeperCheckNotExistsResponse : public ZooKeeperCheckResponse
 {
     OpNum getOpNum() const override { return OpNum::CheckNotExists; }
     using ZooKeeperCheckResponse::ZooKeeperCheckResponse;
+};
+
+struct ZooKeeperCheckStatRequest final : CheckStatRequest, ZooKeeperRequest
+{
+    ZooKeeperCheckStatRequest() = default;
+    explicit ZooKeeperCheckStatRequest(const CheckStatRequest & base) : CheckStatRequest(base) { }
+
+    OpNum getOpNum() const override { return OpNum::CheckStat; }
+    void writeImpl(WriteBuffer & out) const override;
+    void readImpl(ReadBuffer & in) override;
+    ZooKeeperResponsePtr makeResponse() const override;
+    bool isReadRequest() const override { return false; }
+    String toString() const override
+    {
+        return Coordination::toString(getOpNum()) + ", xid " + std::to_string(xid) + ", path " + path;
+    }
+};
+
+struct ZooKeeperCheckStatResponse final : ZooKeeperCheckResponse
+{
+    OpNum getOpNum() const override { return OpNum::CheckStat; }
+    using ZooKeeperCheckResponse::ZooKeeperCheckResponse;
+};
+
+struct ZooKeeperListRecursiveRequest final : ListRecursiveRequest, ZooKeeperRequest
+{
+    ZooKeeperListRecursiveRequest() = default;
+    explicit ZooKeeperListRecursiveRequest(const ListRecursiveRequest & base) : ListRecursiveRequest(base) { }
+
+    OpNum getOpNum() const override { return OpNum::ListRecursive; }
+    void writeImpl(WriteBuffer & out) const override;
+    void readImpl(ReadBuffer & in) override;
+    ZooKeeperResponsePtr makeResponse() const override;
+    bool isReadRequest() const override { return true; }
+    String toString() const override
+    {
+        return Coordination::toString(getOpNum()) + ", xid " + std::to_string(xid) + ", path " + path;
+    }
+};
+
+struct ZooKeeperListRecursiveResponse final : ListRecursiveResponse, ZooKeeperResponse
+{
+    void readImpl(ReadBuffer & in) override;
+    void writeImpl(WriteBuffer & out) const override;
+    OpNum getOpNum() const override { return OpNum::ListRecursive; }
 };
 
 /// This response may be received only as an element of responses in MultiResponse.
