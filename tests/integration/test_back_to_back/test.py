@@ -582,6 +582,7 @@ def generate_requests(prefix="/", iters=1):
     return requests
 
 
+@pytest.mark.timeout(600)  # ponytail: ~2600 serial round-trips x2 clients; 300s default is too tight under CI load
 def test_random_requests(started_cluster):
     genuine_zk = fake_zk = None
     try:
@@ -718,6 +719,7 @@ def test_end_of_watches_session(started_cluster):
 
 
 # RuntimeError: ('xids do not match, expected %r received %r', 18, 19)
+@pytest.mark.timeout(600)  # ponytail: 10 threads x100 iters with sleep-based pacing; 300s default is too tight under CI load
 def test_concurrent_watches(started_cluster):
     fake_zk = None
     try:

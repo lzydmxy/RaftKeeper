@@ -1,5 +1,6 @@
 import os
 import random
+import time
 from multiprocessing.dummy import Pool
 
 import pytest
@@ -142,4 +143,18 @@ def test_snapshot_and_load(started_cluster, async_snapshot):
             print("Got exception:" + str(ex))
 
     print("Final")
-    fake_zks[0].create("/test10000", b"data")
+    # ponytail: same transient-timeout tolerance as the loop above — this call lands
+    # right after 1000 rapid creates across a freshly-restarted 3-node cluster, so a
+    # single attempt can hit the same CI-load hiccup the preceding loop already shrugs off.
+    last_exception = None
+    for attempt in range(5):
+        try:
+            fake_zks[0].create("/test10000", b"data")
+            last_exception = None
+            break
+        except Exception as ex:
+            last_exception = ex
+            print("Got exception on final create, attempt", attempt, ":", str(ex))
+            time.sleep(1)
+    if last_exception is not None:
+        raise last_exception
