@@ -1137,7 +1137,14 @@ TEST(RaftStateMachine, MultiRejectsUnsupportedSubOpWithoutAbort)
 
         ResponseForSession response_for_session;
         ASSERT_TRUE(response_queue.tryPop(response_for_session));
-        ASSERT_EQ(response_for_session.response->error, Error::ZBADARGUMENTS);
+        /// Top-level header error stays ZOK, matching how a normal multi-write
+        /// failure is reported: ZooKeeperResponse::writeNoCopy only serializes the
+        /// per-op body when the top-level error is ZOK, so a non-ZOK top-level error
+        /// here would suppress the body entirely instead of surfacing the real error.
+        ASSERT_EQ(response_for_session.response->error, Error::ZOK);
+        auto & multi_response = dynamic_cast<ZooKeeperMultiResponse &>(*response_for_session.response);
+        ASSERT_EQ(multi_response.responses.size(), 1u);
+        ASSERT_EQ(multi_response.responses[0]->error, Error::ZBADARGUMENTS);
     }
 
     /// Mixed read/write multi: also a clean error, no throw.
@@ -1164,7 +1171,11 @@ TEST(RaftStateMachine, MultiRejectsUnsupportedSubOpWithoutAbort)
 
         ResponseForSession response_for_session;
         ASSERT_TRUE(response_queue.tryPop(response_for_session));
-        ASSERT_EQ(response_for_session.response->error, Error::ZBADARGUMENTS);
+        ASSERT_EQ(response_for_session.response->error, Error::ZOK);
+        auto & multi_response = dynamic_cast<ZooKeeperMultiResponse &>(*response_for_session.response);
+        ASSERT_EQ(multi_response.responses.size(), 2u);
+        ASSERT_EQ(multi_response.responses[0]->error, Error::ZBADARGUMENTS);
+        ASSERT_EQ(multi_response.responses[1]->error, Error::ZBADARGUMENTS);
     }
 
     /// The store must still work after both rejected multis.

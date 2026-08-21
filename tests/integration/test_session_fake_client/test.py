@@ -350,13 +350,26 @@ def test_multi_with_unsupported_subop_returns_error_and_server_survives(started_
 
     # A Multi containing GetACL as a sub-op is unsupported. It must fail with
     # ZBADARGUMENTS and, critically, must NOT abort the server process (which is
-    # what used to happen when the validation threw at Raft apply time).
+    # what used to happen when the validation threw at Raft apply time). Like a
+    # normal multi failure, the top-level header error stays ZOK (ZooKeeper's wire
+    # contract: writeNoCopy only serializes the per-op body when the header error is
+    # ZOK) — the rejection is visible in the per-op error inside the body.
     get_acl_sub = int_struct.pack(6) + bool_struct.pack(0) + int_struct.pack(-1) + write_buffer(b"/some_node")
     multi_terminator = int_struct.pack(-1) + bool_struct.pack(1) + int_struct.pack(-1)
     send_raw_request(client, xid=300, op_num=14, body=get_acl_sub + multi_terminator)
     xid, zxid, err, body = recv_reply(client)
     assert xid == 300
-    assert err == -8  # ZBADARGUMENTS
+    assert err == 0  # top-level header error stays ZOK
+    # The single sub-op result: opnum Error(-1), done 0, error ZBADARGUMENTS(-8), body [-8].
+    assert int_struct.unpack_from(body, 0)[0] == -1
+    assert bool_struct.unpack_from(body, 4)[0] == 0
+    assert int_struct.unpack_from(body, 5)[0] == -8
+    assert int_struct.unpack_from(body, 9)[0] == -8
+    # Footer: opnum Error(-1), done 1, error -1.
+    assert int_struct.unpack_from(body, 13)[0] == -1
+    assert bool_struct.unpack_from(body, 17)[0] == 1
+    assert int_struct.unpack_from(body, 18)[0] == -1
+    assert len(body) == 22
 
     # The server must still be alive: a write through a full client needs a live
     # leader (the bad multi is applied on the leader before it answers).

@@ -10,7 +10,6 @@ namespace RK
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
-    extern const int BAD_ARGUMENTS;
 }
 
 static inline void set_response(
@@ -1365,10 +1364,19 @@ struct StoreRequestMultiTxn final : public StoreRequest
         Coordination::ZooKeeperMultiResponse & response_typed = dynamic_cast<Coordination::ZooKeeperMultiResponse &>(*response);
 
         /// Reject unsupported multis with a clean error instead of throwing at apply
-        /// time, where the exception would abort the server process.
+        /// time, where the exception would abort the server process. Leave the
+        /// top-level error at ZOK (its default): ZooKeeperResponse::writeNoCopy only
+        /// serializes the per-subrequest body when the top-level error is ZOK, so a
+        /// non-ZOK top-level error here would silently suppress the body — the client
+        /// would see an empty multi response instead of the per-op errors. Matches the
+        /// shape the write-rollback path below already produces.
         if (construction_error != Coordination::Error::ZOK)
         {
-            response_typed.error = construction_error;
+            for (auto & sub_response : response_typed.responses)
+            {
+                sub_response = std::make_shared<Coordination::ZooKeeperErrorResponse>();
+                sub_response->error = construction_error;
+            }
             return {response, {}};
         }
 
