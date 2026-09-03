@@ -604,6 +604,11 @@ std::pair<Coordination::OpNum, Coordination::XID> ConnectionHandler::receiveRequ
         auto response = std::make_shared<Coordination::ZooKeeperErrorResponse>();
         response->xid = xid;
         response->error = e.code;
+        /// The request never entered the pipeline, so there is no RequestForSession
+        /// create_time to carry over. Stamp now: updateStats treats this as the
+        /// request-created time, and leaving it 0 would report a bogus multi-decade
+        /// latency and trip the slow-request warning on every rejected request.
+        response->request_created_time_ms = getCurrentTimeMilliseconds();
         pushUserResponseToSendingQueue(response);
     }
     return std::make_pair(opnum, xid);
