@@ -64,6 +64,42 @@ jobs:
       sanitize: none
     needs: build
 
+  # The default matrix builds ZooKeeper-compatible mode. Additionally build ClickHouse-compatible
+  # mode (COMPATIBLE_MODE_ZOOKEEPER=OFF) and run the ClickHouse Keeper back-to-back suite against it,
+  # so cversion / extension-op parity is exercised against a real ClickHouse Keeper.
+  integration-test-clickhouse-mode:
+    runs-on: ubuntu-22.04
+    needs: check-style
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Prepare environment
+        run: bash .github/workflows/prepare-env.sh 18
+
+      - name: Generate Makefile (ClickHouse-compatible mode)
+        run: |
+          export CC=`which clang` CXX=`which clang++`
+          cmake -G Ninja -B ./build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCOMPATIBLE_MODE_ZOOKEEPER=OFF
+
+      - name: Build raftkeeper
+        working-directory: ${{ github.workspace }}/build
+        run: ninja -j 10 raftkeeper
+
+      - name: Add executable privileges
+        run: sudo chmod 755 build/programs/raftkeeper
+
+      - name: Run ClickHouse Keeper back-to-back test
+        run: bash .github/workflows/run-integration-test.sh tests/integration test_clickhouse_keeper_back_to_back --junitxml=integration-test-report-clickhouse-mode.xml
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-report-clickhouse-mode.xml
+          path: tests/integration/integration-test-report-clickhouse-mode.xml
+
   build-tsan:
     uses: ./.github/workflows/build.yml
     with:
