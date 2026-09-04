@@ -80,7 +80,7 @@ def _patch_compose_for_modern_docker():
         p = pathlib.Path(svc.__file__)
         src = p.read_text()
         patched = re.sub(r"image_config\[(['\"])ContainerConfig\1\]",
-                         "(image_config.get('ContainerConfig') or {})", src)
+                         "image_config.get('ContainerConfig', {})", src)
         if patched != src:
             p.write_text(patched)
     except Exception:  # noqa: BLE001 - best-effort; startup will skip with diagnostics if it fails
@@ -99,21 +99,28 @@ def get_clickhouse_keeper():
 
 @pytest.fixture(scope="module")
 def started_cluster():
+    load_status = _maybe_load_keeper_image()
+    _patch_compose_for_modern_docker()
     try:
-        load_status = _maybe_load_keeper_image()
-        _patch_compose_for_modern_docker()
-        try:
-            cluster.start()
-        except Exception as ex:
-            # This suite needs a real ClickHouse Keeper container. If the environment can't provide
-            # its image (e.g. no registry egress from the docker-in-docker daemon), skip rather than
-            # fail the whole integration matrix - RaftKeeper's own startup is covered by other tests.
-            diag = _keeper_diagnostics()
-            cluster.shutdown()
-            pytest.skip(f"ClickHouse Keeper unavailable: {ex}\nload: {load_status}\n{diag}")
+        cluster.start()
+    except Exception as ex:
+        # This suite needs a real ClickHouse Keeper container. If the environment can't provide its
+        # image (e.g. no registry egress from the docker-in-docker daemon), skip rather than fail the
+        # whole integration matrix - RaftKeeper's own startup is covered by other tests.
+        diag = _keeper_diagnostics()
+        _safe_shutdown()
+        pytest.skip(f"ClickHouse Keeper unavailable: {ex}\nload: {load_status}\n{diag}")
+    try:
         yield cluster
     finally:
+        _safe_shutdown()
+
+
+def _safe_shutdown():
+    try:
         cluster.shutdown()
+    except Exception:  # noqa: BLE001 - teardown best-effort; don't mask a skip/test result
+        pass
 
 
 @pytest.fixture()
