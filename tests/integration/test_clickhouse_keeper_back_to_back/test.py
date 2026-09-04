@@ -17,7 +17,9 @@ Absolute stat values (czxid/zxid/ctime) legitimately differ between two independ
 these tests compare *structure* (sorted names), *behavioral parity* (same success/error outcome),
 and version counters that advance deterministically - not raw zxid/time numbers.
 """
+import os
 import re
+import subprocess
 import time
 
 import pytest
@@ -29,6 +31,15 @@ cluster = RaftKeeperCluster(__file__)
 
 node1 = cluster.add_instance('node1', main_configs=['configs/enable_keeper_single_node.xml'],
                              with_clickhouse_keeper=True, stay_alive=True)
+
+
+def _maybe_load_keeper_image():
+    """The docker-in-docker daemon usually can't pull from a registry in CI. If the job pre-pulled
+    the ClickHouse Keeper image on the host and saved it to tests/integration/ch_keeper_image.tar
+    (mounted into the runner), load it into the DIND daemon so docker-compose finds it locally."""
+    tar = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'ch_keeper_image.tar')
+    if os.path.exists(tar):
+        subprocess.run(['docker', 'load', '-i', tar], check=False)
 
 
 def get_raftkeeper():
@@ -44,6 +55,7 @@ def get_clickhouse_keeper():
 @pytest.fixture(scope="module")
 def started_cluster():
     try:
+        _maybe_load_keeper_image()
         try:
             cluster.start()
         except Exception as ex:

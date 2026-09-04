@@ -90,6 +90,13 @@ jobs:
       - name: Add executable privileges
         run: sudo chmod 755 build/programs/raftkeeper
 
+      - name: Pre-pull ClickHouse Keeper image
+        # The docker-in-docker daemon in the runner can't reach Docker Hub; pull on the host (which
+        # can) and save a tarball the test loads into DIND (see _maybe_load_keeper_image).
+        run: |
+          docker pull clickhouse/clickhouse-keeper:latest
+          docker save clickhouse/clickhouse-keeper:latest -o tests/integration/ch_keeper_image.tar
+
       - name: Run ClickHouse Keeper back-to-back test
         # Pass all pytest args as ONE quoted string (see integration-test.yml note).
         run: bash .github/workflows/run-integration-test.sh tests/integration "test_clickhouse_keeper_back_to_back --junitxml=integration-test-report-clickhouse-mode.xml"
