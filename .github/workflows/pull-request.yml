@@ -93,13 +93,8 @@ jobs:
       - name: Pre-pull ClickHouse Keeper image
         # The docker-in-docker daemon in the runner can't reach Docker Hub; pull on the host (which
         # can) and save a tarball the test loads into DIND (see _maybe_load_keeper_image).
-        # docker-compose v1.29 (baked into the runner image) raises KeyError 'ContainerConfig' on
-        # modern OCI images, so commit a container to produce a legacy-format image it accepts.
         run: |
           docker pull clickhouse/clickhouse-keeper:latest
-          cid=$(docker create clickhouse/clickhouse-keeper:latest)
-          docker commit "$cid" clickhouse/clickhouse-keeper:latest
-          docker rm "$cid"
           docker save clickhouse/clickhouse-keeper:latest -o tests/integration/ch_keeper_image.tar
 
       - name: Run ClickHouse Keeper back-to-back test

@@ -68,6 +68,25 @@ def _keeper_diagnostics():
     return "\n".join(out)[:4000]
 
 
+def _patch_compose_for_modern_docker():
+    """docker-compose 1.29 (baked into the runner image) does
+    `container.image_config['ContainerConfig']` when creating a container, but modern Docker Engine
+    no longer returns that field in image inspect, so creating the keeper container raises
+    KeyError 'ContainerConfig'. Patch the installed compose to tolerate its absence. No-op if compose
+    isn't importable or is already patched."""
+    try:
+        import pathlib
+        import compose.service as svc
+        p = pathlib.Path(svc.__file__)
+        src = p.read_text()
+        patched = re.sub(r"image_config\[(['\"])ContainerConfig\1\]",
+                         "(image_config.get('ContainerConfig') or {})", src)
+        if patched != src:
+            p.write_text(patched)
+    except Exception:  # noqa: BLE001 - best-effort; startup will skip with diagnostics if it fails
+        pass
+
+
 def get_raftkeeper():
     zk = KeeperFeatureClient(hosts=cluster.get_instance_ip("node1") + ":8101", timeout=60.0)
     zk.start()
@@ -82,6 +101,7 @@ def get_clickhouse_keeper():
 def started_cluster():
     try:
         load_status = _maybe_load_keeper_image()
+        _patch_compose_for_modern_docker()
         try:
             cluster.start()
         except Exception as ex:
