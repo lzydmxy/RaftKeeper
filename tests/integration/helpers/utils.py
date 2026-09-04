@@ -246,15 +246,15 @@ class ListRecursive(namedtuple('ListRecursive', 'path max_entries')):
         return children
 
 
-class CheckStat(namedtuple('CheckStat', 'path version cversion aversion')):
+class CheckStat(namedtuple('CheckStat', 'path version stat')):
     type = 504
 
     def serialize(self):
+        # Wire: path + version + full Stat (matches ClickHouse Keeper). Any Stat field == -1 is a wildcard.
         b = bytearray()
         b.extend(write_string(self.path))
         b.extend(int_struct.pack(self.version))
-        b.extend(int_struct.pack(self.cversion))
-        b.extend(int_struct.pack(self.aversion))
+        b.extend(stat_struct.pack(*self.stat))
         return b
 
     @classmethod
@@ -372,13 +372,18 @@ class KeeperFeatureClient(KazooClient):
         self._call(ListRecursive(_prefix_root(self.chroot, path), max_entries), async_result)
         return async_result.get()
 
-    def check_stat(self, path, version=-1, cversion=-1, aversion=-1):
-        """Check a node's version/cversion/aversion (OpNum 504).
+    def check_stat(self, path, version=-1, czxid=-1, mzxid=-1, ctime=-1, mtime=-1,
+                   stat_version=-1, cversion=-1, aversion=-1, ephemeral_owner=-1,
+                   data_length=-1, num_children=-1, pzxid=-1):
+        """Check a node's stat (OpNum 504). `version` is the check version; every Stat field left
+        at -1 is a wildcard. Wire format matches ClickHouse Keeper (path + version + full Stat).
 
         :returns: True on match. Raises on mismatch/missing node.
         """
+        stat = (czxid, mzxid, ctime, mtime, stat_version, cversion, aversion,
+                ephemeral_owner, data_length, num_children, pzxid)
         async_result = self.handler.async_result()
-        self._call(CheckStat(_prefix_root(self.chroot, path), version, cversion, aversion), async_result)
+        self._call(CheckStat(_prefix_root(self.chroot, path), version, stat), async_result)
         return async_result.get()
 
     def list_children_with_stats_and_data(self, path, list_type=0, with_stat=True, with_data=True, watch=None):

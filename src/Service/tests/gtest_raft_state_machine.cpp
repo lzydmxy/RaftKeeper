@@ -821,17 +821,18 @@ TEST(RaftStateMachine, CheckStat)
     setNode(machine.getStore(), "check_node", "data", false, session_id);
 
     auto node = machine.getStore().getNode("/check_node");
-    int32_t v = node->stat.version;
-    int32_t cv = node->stat.cversion;
-    int32_t av = node->stat.aversion;
+    auto view = node->statForResponse();
+    int32_t v = view.version;
+    int32_t cv = view.cversion;
+    int32_t av = view.aversion;
 
     /// Matching stat
     {
         auto req = cs_new<ZooKeeperCheckStatRequest>();
         req->path = "/check_node";
         req->version = v;
-        req->cversion = cv;
-        req->aversion = av;
+        req->stat_to_check.cversion = cv;
+        req->stat_to_check.aversion = av;
         req->xid = 1;
 
         KeeperStore::KeeperResponsesQueue response_queue;
@@ -848,8 +849,6 @@ TEST(RaftStateMachine, CheckStat)
         auto req = cs_new<ZooKeeperCheckStatRequest>();
         req->path = "/check_node";
         req->version = v + 1;
-        req->cversion = -1;
-        req->aversion = -1;
         req->xid = 2;
 
         KeeperStore::KeeperResponsesQueue response_queue;
@@ -860,6 +859,180 @@ TEST(RaftStateMachine, CheckStat)
         ASSERT_TRUE(response_queue.tryPop(r));
         ASSERT_EQ(r.response->error, Error::ZBADVERSION);
     }
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, TryRemoveBestEffort)
+{
+    String snap_dir(SNAP_DIR + "/tryremove");
+    String log_dir(LOG_DIR + "/tryremove");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+
+    setNode(machine.getStore(), "parent", "d", false, session_id);
+    setNode(machine.getStore(), "parent/child", "d", false, session_id);
+
+    auto try_remove = [&](const String & path, int32_t version, int32_t xid)
+    {
+        auto req = cs_new<ZooKeeperRemoveRequest>();
+        req->path = path;
+        req->try_remove = true;
+        req->version = version;
+        req->xid = xid;
+        KeeperStore::KeeperResponsesQueue rq;
+        int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+        machine.getStore().processRequest(rq, {req, session_id, time}, {}, true, false);
+        ResponseForSession r;
+        EXPECT_TRUE(rq.tryPop(r));
+        return r.response->error;
+    };
+
+    /// Non-empty node: best-effort TryRemove is a silent no-op success, node survives.
+    ASSERT_EQ(try_remove("/parent", -1, 1), Error::ZOK);
+    ASSERT_NE(machine.getStore().getNode("/parent"), nullptr);
+
+    /// Wrong version: same, ZOK and node survives.
+    ASSERT_EQ(try_remove("/parent/child", 999, 2), Error::ZOK);
+    ASSERT_NE(machine.getStore().getNode("/parent/child"), nullptr);
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, RemoveRecursiveRejectsRoot)
+{
+    String snap_dir(SNAP_DIR + "/rmrec_root");
+    String log_dir(LOG_DIR + "/rmrec_root");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+    setNode(machine.getStore(), "keep_me", "d", false, session_id);
+
+    auto req = cs_new<ZooKeeperRemoveRecursiveRequest>();
+    req->path = "/";
+    req->remove_nodes_limit = 100;
+    req->xid = 1;
+
+    KeeperStore::KeeperResponsesQueue rq;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(rq, {req, session_id, time}, {}, true, false);
+
+    ResponseForSession r;
+    ASSERT_TRUE(rq.tryPop(r));
+    ASSERT_EQ(r.response->error, Error::ZBADARGUMENTS);
+    /// Tree untouched.
+    ASSERT_NE(machine.getStore().getNode("/keep_me"), nullptr);
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, CheckStatFullFields)
+{
+    String snap_dir(SNAP_DIR + "/checkstat_full");
+    String log_dir(LOG_DIR + "/checkstat_full");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+    setNode(machine.getStore(), "cnode", "hello", false, session_id);
+
+    auto view = machine.getStore().getNode("/cnode")->statForResponse();
+
+    auto check = [&](const std::function<void(ZooKeeperCheckStatRequest &)> & fill, int32_t xid)
+    {
+        auto req = cs_new<ZooKeeperCheckStatRequest>();
+        req->path = "/cnode";
+        fill(*req);
+        req->xid = xid;
+        KeeperStore::KeeperResponsesQueue rq;
+        int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+        machine.getStore().processRequest(rq, {req, session_id, time}, {}, true, false);
+        ResponseForSession r;
+        EXPECT_TRUE(rq.tryPop(r));
+        return r.response->error;
+    };
+
+    /// dataLength mismatch is now caught (was ignored before - only version/cversion/aversion were checked).
+    ASSERT_EQ(check([&](auto & q) { q.stat_to_check.dataLength = view.dataLength + 1; }, 1), Error::ZBADVERSION);
+    /// pzxid mismatch caught too.
+    ASSERT_EQ(check([&](auto & q) { q.stat_to_check.pzxid = view.pzxid + 1; }, 2), Error::ZBADVERSION);
+    /// Matching full stat -> ZOK.
+    ASSERT_EQ(check([&](auto & q) { q.stat_to_check.dataLength = view.dataLength; q.stat_to_check.pzxid = view.pzxid; q.stat_to_check.czxid = view.czxid; }, 3), Error::ZOK);
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, GetACLStatConsistentWithGet)
+{
+    String snap_dir(SNAP_DIR + "/getacl_stat");
+    String log_dir(LOG_DIR + "/getacl_stat");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+    setNode(machine.getStore(), "gnode", "data", false, session_id);
+    /// Create a child so cversion/numChildren are non-trivial and the statForResponse transform matters.
+    setNode(machine.getStore(), "gnode/c", "d", false, session_id);
+
+    auto run = [&](ZooKeeperRequestPtr req, int32_t xid) -> Coordination::Stat
+    {
+        req->xid = xid;
+        KeeperStore::KeeperResponsesQueue rq;
+        int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+        machine.getStore().processRequest(rq, {req, session_id, time}, {}, true, false);
+        ResponseForSession r;
+        EXPECT_TRUE(rq.tryPop(r));
+        if (auto * g = dynamic_cast<ZooKeeperGetResponse *>(r.response.get()))
+            return g->stat;
+        return dynamic_cast<ZooKeeperGetACLResponse &>(*r.response).stat;
+    };
+
+    auto get_req = cs_new<ZooKeeperGetRequest>();
+    get_req->path = "/gnode";
+    auto get_stat = run(get_req, 1);
+
+    auto acl_req = cs_new<ZooKeeperGetACLRequest>();
+    acl_req->path = "/gnode";
+    auto acl_stat = run(acl_req, 2);
+
+    /// GetACL must report the same client-facing stat as Get (both via statForResponse).
+    ASSERT_EQ(acl_stat.cversion, get_stat.cversion);
+    ASSERT_EQ(acl_stat.numChildren, get_stat.numChildren);
 
     machine.shutdown();
     cleanDirectory(snap_dir);
@@ -1007,8 +1180,6 @@ TEST(RaftStateMachine, MultiWriteWithCheckStatAndTryRemove)
         auto cs = cs_new<ZooKeeperCheckStatRequest>();
         cs->path = "/mnode";
         cs->version = ver;
-        cs->cversion = -1;
-        cs->aversion = -1;
         multi->requests.push_back(cs);
     }
     {
