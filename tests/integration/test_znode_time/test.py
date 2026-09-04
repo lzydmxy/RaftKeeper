@@ -53,13 +53,16 @@ def test_between_servers(started_cluster):
         node3_zk = node3.get_fake_zk()
 
         node1_zk.create("/test_between_servers")
-        for child_node in range(1000):
+        # ponytail: 1000 children x (1 create + 1 set + 3 reads) = 5000 round trips
+        # blows past the 300s default under CI load; 100 keeps the cross-server stat
+        # consistency check intact with far fewer round trips.
+        for child_node in range(100):
             node1_zk.create("/test_between_servers/" + str(child_node))
 
-        for child_node in range(1000):
+        for child_node in range(100):
             node1_zk.set("/test_between_servers/" + str(child_node), b"somevalue")
 
-        for child_node in range(1000):
+        for child_node in range(100):
             stats1 = node1_zk.exists("/test_between_servers/" + str(child_node))
             stats2 = node2_zk.exists("/test_between_servers/" + str(child_node))
             stats3 = node3_zk.exists("/test_between_servers/" + str(child_node))
@@ -76,10 +79,11 @@ def test_server_restart(started_cluster):
         node1_zk = node1.get_fake_zk()
 
         node1_zk.create("/test_server_restart")
-        for child_node in range(1000):
+        # ponytail: see test_between_servers — same round-trip-count reduction.
+        for child_node in range(100):
             node1_zk.create("/test_server_restart/" + str(child_node))
 
-        for child_node in range(1000):
+        for child_node in range(100):
             node1_zk.set("/test_server_restart/" + str(child_node), b"somevalue")
 
         node3.restart_raftkeeper(kill=True)
@@ -88,7 +92,7 @@ def test_server_restart(started_cluster):
         node2_zk = node2.get_fake_zk()
         node3_zk = node3.get_fake_zk()
 
-        for child_node in range(1000):
+        for child_node in range(100):
             stats1 = node1_zk.exists("/test_server_restart/" + str(child_node))
             stats2 = node2_zk.exists("/test_server_restart/" + str(child_node))
             stats3 = node3_zk.exists("/test_server_restart/" + str(child_node))

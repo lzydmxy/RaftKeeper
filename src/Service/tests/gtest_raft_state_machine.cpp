@@ -3,10 +3,14 @@
 #include <Service/NuRaftStateMachine.h>
 #include <Service/KeeperCommon.h>
 #include <Service/tests/raft_test_common.h>
+#include <Common/IO/ReadBufferFromMemory.h>
+#include <Common/IO/WriteBufferFromString.h>
+#include <ZooKeeper/ZooKeeperIO.h>
 #include <gtest/gtest.h>
 #include <libnuraft/nuraft.hxx>
 #include <Poco/File.h>
 #include <Poco/Logger.h>
+#include <set>
 
 using namespace nuraft;
 using namespace RK;
@@ -522,12 +526,19 @@ TEST(RaftStateMachine, MultiReadRejectsWriteOps)
 
     KeeperStore::KeeperResponsesQueue response_queue;
     int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
-    EXPECT_THROW(
-        {
-            machine.getStore().processRequest(
-                response_queue, {multi_read, session_id, time}, {}, /*check_acl=*/true, /*ignore_response=*/false);
-        },
-        RK::Exception);
+    /// The bad sub-op must produce a clean per-subrequest error response — a throw
+    /// here would leave the client hanging (read-path exceptions send no response).
+    machine.getStore().processRequest(
+        response_queue, {multi_read, session_id, time}, {}, /*check_acl=*/true, /*ignore_response=*/false);
+
+    ResponseForSession response_for_session;
+    ASSERT_TRUE(response_queue.tryPop(response_for_session));
+    auto & multi_response = dynamic_cast<ZooKeeperMultiResponse &>(*response_for_session.response);
+    ASSERT_EQ(multi_response.responses.size(), 2u);
+    /// The valid read sub-op still succeeds.
+    ASSERT_EQ(multi_response.responses[0]->error, Error::ZOK);
+    /// The write sub-op is rejected with ZBADARGUMENTS at its own position.
+    ASSERT_EQ(multi_response.responses[1]->error, Error::ZBADARGUMENTS);
 
     machine.shutdown();
     cleanDirectory(snap_dir);
@@ -1086,6 +1097,245 @@ TEST(RaftStateMachine, MultiRemoveRecursiveRollback)
     ASSERT_EQ(machine.getStore().getNode("/")->stat.numChildren, parent_children_before);
     /// /r still has both children
     ASSERT_EQ(machine.getStore().getNode("/r")->children.size(), 2u);
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(RaftStateMachine, MultiRejectsUnsupportedSubOpWithoutAbort)
+{
+    String snap_dir(SNAP_DIR + "/multi_bad_subop");
+    String log_dir(LOG_DIR + "/multi_bad_subop");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+
+    /// Multi with GetACL: not supported as a sub-op. Must fail with a clean error
+    /// instead of throwing at apply time, where RequestProcessor aborts the server.
+    {
+        auto multi = cs_new<ZooKeeperMultiRequest>();
+        multi->operation_type = ZooKeeperMultiRequest::OperationType::Write;
+        multi->xid = 700;
+
+        auto get_acl = cs_new<ZooKeeperGetACLRequest>();
+        get_acl->path = "/some_node";
+        get_acl->xid = 700;
+        multi->requests.push_back(get_acl);
+
+        KeeperStore::KeeperResponsesQueue response_queue;
+        int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+        machine.getStore().processRequest(response_queue, {multi, session_id, time}, {}, /*check_acl=*/true, /*ignore_response=*/false);
+
+        ResponseForSession response_for_session;
+        ASSERT_TRUE(response_queue.tryPop(response_for_session));
+        /// Top-level header error stays ZOK, matching how a normal multi-write
+        /// failure is reported: ZooKeeperResponse::writeNoCopy only serializes the
+        /// per-op body when the top-level error is ZOK, so a non-ZOK top-level error
+        /// here would suppress the body entirely instead of surfacing the real error.
+        ASSERT_EQ(response_for_session.response->error, Error::ZOK);
+        auto & multi_response = dynamic_cast<ZooKeeperMultiResponse &>(*response_for_session.response);
+        ASSERT_EQ(multi_response.responses.size(), 1u);
+        ASSERT_EQ(multi_response.responses[0]->error, Error::ZBADARGUMENTS);
+    }
+
+    /// Mixed read/write multi: also a clean error, no throw.
+    {
+        auto multi = cs_new<ZooKeeperMultiRequest>();
+        multi->operation_type = ZooKeeperMultiRequest::OperationType::Unspecified;
+        multi->xid = 701;
+
+        auto set_req = cs_new<ZooKeeperSetRequest>();
+        set_req->path = "/some_node";
+        set_req->data = "x";
+        set_req->version = -1;
+        set_req->xid = 701;
+        multi->requests.push_back(set_req);
+
+        auto get_req = cs_new<ZooKeeperGetRequest>();
+        get_req->path = "/some_node";
+        get_req->xid = 701;
+        multi->requests.push_back(get_req);
+
+        KeeperStore::KeeperResponsesQueue response_queue;
+        int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+        machine.getStore().processRequest(response_queue, {multi, session_id, time}, {}, /*check_acl=*/true, /*ignore_response=*/false);
+
+        ResponseForSession response_for_session;
+        ASSERT_TRUE(response_queue.tryPop(response_for_session));
+        ASSERT_EQ(response_for_session.response->error, Error::ZOK);
+        auto & multi_response = dynamic_cast<ZooKeeperMultiResponse &>(*response_for_session.response);
+        ASSERT_EQ(multi_response.responses.size(), 2u);
+        ASSERT_EQ(multi_response.responses[0]->error, Error::ZBADARGUMENTS);
+        ASSERT_EQ(multi_response.responses[1]->error, Error::ZBADARGUMENTS);
+    }
+
+    /// The store must still work after both rejected multis.
+    setNode(machine.getStore(), "still_alive", "yes", false, session_id);
+    ASSERT_EQ(machine.getStore().getNode("/still_alive")->data, "yes");
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+TEST(ZooKeeperCreateRequest, RejectsTTLAndContainerModesWithoutWireDesync)
+{
+    /// ZK 3.5+ TTL create modes append a trailing int64 ttl after the flags. It must
+    /// be consumed, and the mode rejected, instead of silently creating a permanent
+    /// node and leaving the next request to parse garbage.
+    {
+        WriteBufferFromOwnString buf;
+        Coordination::write(String("/ttl_node"), buf);
+        Coordination::write(String("data"), buf);
+        ACLs acls;
+        Coordination::write(acls, buf);
+        Coordination::write(int32_t{5}, buf); /// PERSISTENT_WITH_TTL
+        Coordination::write(int64_t{60000}, buf);
+
+        auto request = cs_new<ZooKeeperCreateRequest>();
+        ReadBufferFromMemory in(buf.str().data(), buf.str().size());
+        EXPECT_THROW(request->readImpl(in), Coordination::Exception);
+        EXPECT_TRUE(in.eof()) << "The trailing ttl must be consumed, otherwise the next request on the connection parses garbage";
+    }
+
+    {
+        WriteBufferFromOwnString buf;
+        Coordination::write(String("/seq_ttl_node"), buf);
+        Coordination::write(String("data"), buf);
+        ACLs acls;
+        Coordination::write(acls, buf);
+        Coordination::write(int32_t{6}, buf); /// PERSISTENT_SEQUENTIAL_WITH_TTL
+        Coordination::write(int64_t{60000}, buf);
+
+        auto request = cs_new<ZooKeeperCreateRequest>();
+        ReadBufferFromMemory in(buf.str().data(), buf.str().size());
+        EXPECT_THROW(request->readImpl(in), Coordination::Exception);
+        EXPECT_TRUE(in.eof());
+    }
+
+    /// Container mode is rejected with a clean error (matches ClickHouse Keeper).
+    {
+        WriteBufferFromOwnString buf;
+        Coordination::write(String("/container_node"), buf);
+        Coordination::write(String("data"), buf);
+        ACLs acls;
+        Coordination::write(acls, buf);
+        Coordination::write(int32_t{4}, buf); /// CONTAINER
+
+        auto request = cs_new<ZooKeeperCreateRequest>();
+        ReadBufferFromMemory in(buf.str().data(), buf.str().size());
+        EXPECT_THROW(request->readImpl(in), Coordination::Exception);
+        EXPECT_TRUE(in.eof());
+    }
+
+    /// Unknown create mode is rejected too.
+    {
+        WriteBufferFromOwnString buf;
+        Coordination::write(String("/bad_node"), buf);
+        Coordination::write(String("data"), buf);
+        ACLs acls;
+        Coordination::write(acls, buf);
+        Coordination::write(int32_t{42}, buf);
+
+        auto request = cs_new<ZooKeeperCreateRequest>();
+        ReadBufferFromMemory in(buf.str().data(), buf.str().size());
+        EXPECT_THROW(request->readImpl(in), Coordination::Exception);
+        EXPECT_TRUE(in.eof());
+    }
+}
+
+TEST(RaftStateMachine, SetWatchesRestoresChildAndExistWatches)
+{
+    String snap_dir(SNAP_DIR + "/set_watches_restore");
+    String log_dir(LOG_DIR + "/set_watches_restore");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+
+    /// /leaf (no children, pzxid never moves), then /parent and /parent/child
+    /// (the child create bumps /parent's pzxid).
+    setNode(machine.getStore(), "leaf", "l", false, session_id);
+    setNode(machine.getStore(), "parent", "p", false, session_id);
+    setNode(machine.getStore(), "parent/child", "c", false, session_id);
+
+    /// A reconnect SetWatches with relative_zxid 1: /parent's pzxid moved, so that
+    /// child watch must fire CHILD (not be spuriously DELETED and dropped); the exist
+    /// watch on an existing node must fire CREATED; a data watch on a missing node
+    /// must fire DELETED; an unchanged child watch (/leaf) must re-register silently.
+    /// In this direct-processRequest test path, create() runs with the pre-increment
+    /// zxid, so /leaf gets pzxid 0 and /parent's child create sets its pzxid to 2;
+    /// production commits pass the zxid in first, but the comparisons hold either way.
+    auto set_watches = cs_new<ZooKeeperSetWatchesRequest>();
+    set_watches->relative_zxid = 1;
+    set_watches->xid = 702;
+    set_watches->data_watches.emplace_back("/data_gone");
+    set_watches->exist_watches.emplace_back("/parent");
+    set_watches->exist_watches.emplace_back("/exist_gone");
+    set_watches->list_watches.emplace_back("/parent");
+    set_watches->list_watches.emplace_back("/leaf");
+
+    /// Another session also watches /parent. The restore must fire only the
+    /// re-registering session's own watch — session2's watch must survive and must
+    /// not receive a spurious event.
+    int64_t session2 = machine.getStore().getSessionID(30000);
+    {
+        auto get_req = cs_new<ZooKeeperGetRequest>();
+        get_req->path = "/parent";
+        get_req->has_watch = true;
+        get_req->xid = 703;
+        KeeperStore::KeeperResponsesQueue rsp_queue;
+        int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+        machine.getStore().processRequest(rsp_queue, {get_req, session2, time}, {}, /*check_acl=*/true, /*ignore_response=*/true);
+    }
+
+    uint64_t watches_before = machine.getStore().getTotalWatchesCount();
+
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(response_queue, {set_watches, session_id, time}, {}, /*check_acl=*/true, /*ignore_response=*/false);
+
+    /// Collect the watch events fired.
+    std::multiset<std::pair<String, int>> fired;
+    ResponseForSession response_for_session;
+    while (response_queue.tryPop(response_for_session))
+    {
+        if (auto * watch_response = dynamic_cast<Coordination::ZooKeeperWatchResponse *>(response_for_session.response.get()))
+        {
+            fired.emplace(watch_response->path, watch_response->type);
+            /// Fired events must only ever go to the re-registering session.
+            ASSERT_EQ(response_for_session.session_id, session_id);
+        }
+    }
+
+    ASSERT_EQ(fired.count(std::make_pair(String("/data_gone"), Coordination::Event::DELETED)), 1u);
+    ASSERT_EQ(fired.count(std::make_pair(String("/parent"), Coordination::Event::CREATED)), 1u);
+    ASSERT_EQ(fired.count(std::make_pair(String("/parent"), Coordination::Event::CHILD)), 1u);
+    /// No spurious DELETED for the existing /parent child watch.
+    ASSERT_EQ(fired.count(std::make_pair(String("/parent"), Coordination::Event::DELETED)), 0u);
+    /// The unchanged child watch on /leaf must not fire anything.
+    ASSERT_EQ(fired.count(std::make_pair(String("/leaf"), Coordination::Event::CHILD)), 0u);
+    ASSERT_EQ(fired.count(std::make_pair(String("/leaf"), Coordination::Event::DELETED)), 0u);
+
+    /// Silent registrations survive (exist watch on /exist_gone + child watch on
+    /// /leaf), and session2's /parent watch was not consumed by the restore.
+    ASSERT_EQ(machine.getStore().getTotalWatchesCount(), watches_before + 2);
 
     machine.shutdown();
     cleanDirectory(snap_dir);

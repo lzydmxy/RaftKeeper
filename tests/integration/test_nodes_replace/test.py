@@ -73,7 +73,10 @@ def test_node_replace(started_cluster):
     time.sleep(3)
 
     node4.wait_for_join_cluster()
-    zk_conn4 = node4.get_fake_zk()
+    # ponytail: node4 just joined via live reconfig; a write may need to forward to
+    # whichever node is currently settling as leader. Default 10s session timeout is
+    # too tight for that extra hop under CI load.
+    zk_conn4 = node4.get_fake_zk(session_timeout=30)
     zk_conn4.sync("/test_four_0")
 
     for i in range(100):

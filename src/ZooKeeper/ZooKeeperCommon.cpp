@@ -130,6 +130,22 @@ void ZooKeeperCreateRequest::readImpl(ReadBuffer & in)
     int32_t flags = 0;
     Coordination::read(flags, in);
 
+    /// ZK 3.5+ create modes. TTL modes append a trailing int64 ttl after the flags;
+    /// it must be consumed even though RaftKeeper does not support TTL nodes,
+    /// otherwise the next request on the connection would parse garbage.
+    if (flags == 5 || flags == 6) /// PERSISTENT_WITH_TTL / PERSISTENT_SEQUENTIAL_WITH_TTL
+    {
+        int64_t ttl = 0;
+        Coordination::read(ttl, in);
+        throw Exception("TTL nodes are not supported by RaftKeeper", Error::ZUNIMPLEMENTED);
+    }
+
+    if (flags == 4) /// CONTAINER
+        throw Exception("Container nodes are not supported", Error::ZBADARGUMENTS);
+
+    if (flags < 0 || flags > 6)
+        throw Exception("Unknown create mode flag " + std::to_string(flags), Error::ZBADARGUMENTS);
+
     if (flags & 1)
         is_ephemeral = true;
     if (flags & 2)
