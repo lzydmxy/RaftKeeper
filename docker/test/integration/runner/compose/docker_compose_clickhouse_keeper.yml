@@ -1,9 +1,11 @@
 services:
     # Single-node ClickHouse Keeper used as a "genuine" comparison target in back-to-back tests
     # (mirrors docker_compose_zookeeper.yml, but speaks the ClickHouse Keeper extension ops 500-507).
-    # Image tag is overridable via CLICKHOUSE_KEEPER_TAG. The extension-op semantics are stable across
-    # recent releases, so "latest" is a reasonable default; pin it for reproducible CI. For exact parity
-    # with a specific build, bind a local clickhouse-keeper binary the way ClickHouse's own harness does.
+    # Image is overridable via CLICKHOUSE_KEEPER_IMAGE. The extension-op semantics are stable across
+    # recent releases, so "latest" is a reasonable default; pin it for reproducible CI.
+    #
+    # No cpu/memory limits: applying a CPU cgroup controller fails inside the docker-in-docker runner
+    # on cgroup v2 ("cannot enter cgroupv2 ... with domain controllers -- invalid state").
     ch_keeper1:
         image: ${CLICKHOUSE_KEEPER_IMAGE:-clickhouse/clickhouse-keeper:latest}
         stop_grace_period: 5s
@@ -19,10 +21,6 @@ services:
             - type: ${CH_KEEPER_FS:-tmpfs}
               source: ${CH_KEEPER_DATA:-}
               target: /var/lib/clickhouse-keeper
-        cap_add:
-            - SYS_NICE
-            - IPC_LOCK
         security_opt:
             - label:disable
             - seccomp:unconfined
-        cpus: 3
