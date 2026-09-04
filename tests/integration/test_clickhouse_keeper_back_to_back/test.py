@@ -33,13 +33,39 @@ node1 = cluster.add_instance('node1', main_configs=['configs/enable_keeper_singl
                              with_clickhouse_keeper=True, stay_alive=True)
 
 
+def _keeper_image_tar():
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'ch_keeper_image.tar')
+
+
 def _maybe_load_keeper_image():
     """The docker-in-docker daemon usually can't pull from a registry in CI. If the job pre-pulled
     the ClickHouse Keeper image on the host and saved it to tests/integration/ch_keeper_image.tar
-    (mounted into the runner), load it into the DIND daemon so docker-compose finds it locally."""
-    tar = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'ch_keeper_image.tar')
-    if os.path.exists(tar):
-        subprocess.run(['docker', 'load', '-i', tar], check=False)
+    (mounted into the runner), load it into the DIND daemon so docker-compose finds it locally.
+    Returns a short status string for diagnostics."""
+    tar = _keeper_image_tar()
+    if not os.path.exists(tar):
+        return f"no image tarball at {tar} (DIND will try to pull)"
+    r = subprocess.run(['docker', 'load', '-i', tar], capture_output=True, text=True)
+    return f"docker load rc={r.returncode}: {(r.stdout + r.stderr).strip()[:300]}"
+
+
+def _keeper_diagnostics():
+    """Collect why the ClickHouse Keeper couldn't start, for the skip message."""
+    out = []
+    for cmd in (['docker', 'images'], ['docker', 'ps', '-a']):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        out.append(f"$ {' '.join(cmd)}\n{r.stdout}{r.stderr}")
+    try:
+        r = subprocess.run(cluster.base_clickhouse_keeper_cmd + ['up', '-d', '--force-recreate'],
+                           capture_output=True, text=True,
+                           env={**os.environ, 'CH_KEEPER_CONFIG': cluster.clickhouse_keeper_config_path})
+        out.append(f"$ compose up rc={r.returncode}\n{r.stdout}{r.stderr}")
+        logs = subprocess.run(['docker', 'logs', cluster.get_instance_docker_id('ch_keeper1')],
+                              capture_output=True, text=True)
+        out.append(f"$ ch_keeper1 logs\n{logs.stdout}{logs.stderr}")
+    except Exception as e:  # noqa: BLE001
+        out.append(f"diag error: {e}")
+    return "\n".join(out)[:4000]
 
 
 def get_raftkeeper():
@@ -55,15 +81,16 @@ def get_clickhouse_keeper():
 @pytest.fixture(scope="module")
 def started_cluster():
     try:
-        _maybe_load_keeper_image()
+        load_status = _maybe_load_keeper_image()
         try:
             cluster.start()
         except Exception as ex:
             # This suite needs a real ClickHouse Keeper container. If the environment can't provide
             # its image (e.g. no registry egress from the docker-in-docker daemon), skip rather than
             # fail the whole integration matrix - RaftKeeper's own startup is covered by other tests.
+            diag = _keeper_diagnostics()
             cluster.shutdown()
-            pytest.skip(f"ClickHouse Keeper unavailable, skipping back-to-back suite: {ex}")
+            pytest.skip(f"ClickHouse Keeper unavailable: {ex}\nload: {load_status}\n{diag}")
         yield cluster
     finally:
         cluster.shutdown()
