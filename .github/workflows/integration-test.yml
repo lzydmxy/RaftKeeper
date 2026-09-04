@@ -27,7 +27,9 @@ jobs:
         run: bash .github/workflows/prepare-env.sh 18
 
       - name: Run integration Tests
-        run: bash .github/workflows/run-integration-test.sh tests/integration --junitxml=integration-test-report-${{ inputs.sanitize }}.xml
+        # test_clickhouse_keeper_back_to_back needs a ClickHouse-compatible build and is run by the
+        # dedicated integration-test-clickhouse-mode job instead (this matrix builds ZooKeeper mode).
+        run: bash .github/workflows/run-integration-test.sh tests/integration --ignore=test_clickhouse_keeper_back_to_back --junitxml=integration-test-report-${{ inputs.sanitize }}.xml
 
       - name: Upload test report
         if: always()
