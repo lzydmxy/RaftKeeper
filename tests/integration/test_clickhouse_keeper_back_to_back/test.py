@@ -273,8 +273,13 @@ def test_filtered_list_parity(clients, list_type, label):
         zk.create('/fl/e1', ephemeral=True)
     _setup(clients, setup)
     try:
+        # FilteredList returns (children, parent_stat); compare only the child names (the stat's
+        # czxid/mtime legitimately differ between servers).
+        def names(result):
+            children = result[0] if isinstance(result, tuple) else result
+            return sorted(children)
         assert_same_outcome(clients, lambda zk: zk.get_filtered_children('/fl', list_type=list_type),
-                            normalize=lambda names: sorted(names), label=f"filtered_list {label}")
+                            normalize=names, label=f"filtered_list {label}")
     finally:
         _cleanup(clients, '/fl')
 
