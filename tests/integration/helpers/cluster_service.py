@@ -337,15 +337,22 @@ class RaftKeeperCluster:
     def wait_clickhouse_keeper_to_start(self, timeout=60):
         start = time.time()
         while time.time() - start < timeout:
+            conn = None
             try:
                 conn = self.get_clickhouse_keeper_client()
                 conn.get_children('/')
-                conn.stop()
                 print("ClickHouse Keeper started")
                 return
             except Exception as ex:
                 print("Can't connect to ClickHouse Keeper " + str(ex))
                 time.sleep(0.5)
+            finally:
+                if conn is not None:
+                    try:
+                        conn.stop()
+                        conn.close()
+                    except Exception:
+                        pass
 
         raise Exception("Cannot wait ClickHouse Keeper container")
 

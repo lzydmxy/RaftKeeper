@@ -1,3 +1,4 @@
+version: '2.3'
 services:
     # Single-node ClickHouse Keeper used as a "genuine" comparison target in back-to-back tests
     # (mirrors docker_compose_zookeeper.yml, but speaks the ClickHouse Keeper extension ops 500-507).
