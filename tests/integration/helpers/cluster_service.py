@@ -106,6 +106,9 @@ class RaftKeeperCluster:
             HELPERS_DIR, 'zookeeper_config.xml')
 
         self.clickhouse_keeper_config_path = p.join(HELPERS_DIR, 'clickhouse_keeper_config.xml')
+        self.clickhouse_keeper_cluster_config_paths = [
+            p.join(HELPERS_DIR, 'clickhouse_keeper_cluster_config{}.xml'.format(i)) for i in (1, 2, 3)
+        ]
 
         self.project_name = pwd.getpwuid(os.getuid()).pw_name + p.basename(self.base_dir) + self.name
         # docker-compose removes everything non-alphanumeric from project names, so we do it too.
@@ -130,7 +133,8 @@ class RaftKeeperCluster:
 
         self.with_clickhouse_keeper = False
         self.base_clickhouse_keeper_cmd = None
-
+        self.with_clickhouse_keeper_cluster = False
+        self.base_clickhouse_keeper_cluster_cmd = None
         self.zookeeper_use_tmpfs = True
 
         self.docker_client = None
@@ -142,7 +146,8 @@ class RaftKeeperCluster:
                      raftkeeper_path_dir=None,
                      hostname=None, env_variables=None, image="raftkeeper/raftkeeper-integration-tests", tag=None,
                      stay_alive=False, ipv4_address=None, ipv6_address=None, with_installed_binary=False, tmpfs=None,
-                     zookeeper_use_tmpfs=True, use_old_bin=False, with_clickhouse_keeper=False):
+                     zookeeper_use_tmpfs=True, use_old_bin=False, with_clickhouse_keeper=False,
+                     with_clickhouse_keeper_cluster=False):
         """Add an instance to the cluster.
 
         name - the name of the instance directory and the value of the 'instance' macro in RaftKeeper.
@@ -226,6 +231,15 @@ class RaftKeeperCluster:
                                                '--project-name', self.project_name,
                                                '--file', ch_keeper_docker_compose_path]
             cmds.append(self.base_clickhouse_keeper_cmd)
+
+        if with_clickhouse_keeper_cluster and not self.with_clickhouse_keeper_cluster:
+            ch_keeper_cluster_compose_path = p.join(docker_compose_yml_dir, 'docker_compose_clickhouse_keeper_cluster.yml')
+            self.with_clickhouse_keeper_cluster = True
+            self.base_cmd.extend(['--file', ch_keeper_cluster_compose_path])
+            self.base_clickhouse_keeper_cluster_cmd = ['docker-compose', '--project-directory', self.base_dir,
+                                                       '--project-name', self.project_name,
+                                                       '--file', ch_keeper_cluster_compose_path]
+            cmds.append(self.base_clickhouse_keeper_cluster_cmd)
 
         if self.with_net_trics:
             for cmd in cmds:
@@ -356,6 +370,30 @@ class RaftKeeperCluster:
 
         raise Exception("Cannot wait ClickHouse Keeper container")
 
+    def wait_clickhouse_keeper_cluster_to_start(self, timeout=60):
+        start = time.time()
+        while time.time() - start < timeout:
+            conns = []
+            try:
+                for instance in ('ch_keeper1', 'ch_keeper2', 'ch_keeper3'):
+                    conn = self.get_clickhouse_keeper_client(instance)
+                    conns.append(conn)
+                    conn.get_children('/')
+                print("ClickHouse Keeper cluster started")
+                return
+            except Exception as ex:
+                print("Can't connect to ClickHouse Keeper cluster " + str(ex))
+                time.sleep(0.5)
+            finally:
+                for conn in conns:
+                    try:
+                        conn.stop()
+                        conn.close()
+                    except Exception:
+                        pass
+
+        raise Exception("Cannot wait ClickHouse Keeper cluster")
+
     def start(self, destroy_dirs=True):
         print(f"Cluster start called. is_up={self.is_up}, destroy_dirs={destroy_dirs}")
         if self.is_up:
@@ -416,6 +454,14 @@ class RaftKeeperCluster:
                     env['CH_KEEPER_DATA'] = ch_keeper_data_path
                 subprocess.check_call(self.base_clickhouse_keeper_cmd + common_opts, env=env)
                 self.wait_clickhouse_keeper_to_start(120)
+
+            if self.with_clickhouse_keeper_cluster and self.base_clickhouse_keeper_cluster_cmd:
+                print('Setup ClickHouse Keeper cluster')
+                env = os.environ.copy()
+                for i, cfg in enumerate(self.clickhouse_keeper_cluster_config_paths, start=1):
+                    env['CH_KEEPER_CONFIG{}'.format(i)] = cfg
+                subprocess.check_call(self.base_clickhouse_keeper_cluster_cmd + common_opts, env=env)
+                self.wait_clickhouse_keeper_cluster_to_start(120)
 
             raftkeeper_start_cmd = self.base_cmd + ['up', '-d', '--no-recreate']
             print(("Trying to create RaftKeeper instance by command %s", ' '.join(map(str, raftkeeper_start_cmd))))
