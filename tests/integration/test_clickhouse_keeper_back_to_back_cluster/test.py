@@ -69,18 +69,39 @@ def _patch_compose_for_modern_docker():
         pass
 
 
+def _keeper_cluster_compose_up():
+    """Bring up (only) the reference ClickHouse Keeper cluster via compose. Returns (rc, output)."""
+    env = {**os.environ}
+    for i, cfg in enumerate(cluster.clickhouse_keeper_cluster_config_paths, start=1):
+        env[f'CH_KEEPER_CONFIG{i}'] = cfg
+    r = subprocess.run(cluster.base_clickhouse_keeper_cluster_cmd + ['up', '-d', '--force-recreate'],
+                       capture_output=True, text=True, env=env)
+    return r.returncode, f"$ cluster compose up rc={r.returncode}\n{r.stdout}{r.stderr}"
+
+
+def _reference_keeper_works():
+    """Can the reference ClickHouse Keeper cluster actually run here? Retry its bring-up and probe
+    real client connections. Used to decide skip-vs-fail after cluster.start() fails: only a
+    verified reference-side failure may skip; a RaftKeeper-side failure must fail the suite (this
+    job is the only integration coverage for the ClickHouse-mode build)."""
+    try:
+        rc, out = _keeper_cluster_compose_up()
+        print(out)
+        if rc != 0:
+            return False
+        cluster.wait_clickhouse_keeper_cluster_to_start(30)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"reference keeper probe failed: {e}")
+        return False
+
+
 def _keeper_diagnostics():
     out = []
     for cmd in (['docker', 'images'], ['docker', 'ps', '-a']):
         r = subprocess.run(cmd, capture_output=True, text=True)
         out.append(f"$ {' '.join(cmd)}\n{r.stdout}{r.stderr}")
     try:
-        env = {**os.environ}
-        for i, cfg in enumerate(cluster.clickhouse_keeper_cluster_config_paths, start=1):
-            env[f'CH_KEEPER_CONFIG{i}'] = cfg
-        r = subprocess.run(cluster.base_clickhouse_keeper_cluster_cmd + ['up', '-d', '--force-recreate'],
-                           capture_output=True, text=True, env=env)
-        out.append(f"$ cluster compose up rc={r.returncode}\n{r.stdout}{r.stderr}")
         for inst in ('ch_keeper1', 'ch_keeper2', 'ch_keeper3'):
             logs = subprocess.run(['docker', 'logs', cluster.get_instance_docker_id(inst)],
                                   capture_output=True, text=True)
@@ -104,7 +125,16 @@ def started_cluster():
     try:
         cluster.start()
     except Exception as ex:
+        # Skip only when the failure is verifiably on the reference side (image unreachable in
+        # docker-in-docker etc.). If the reference keeper cluster works, the failure came from
+        # RaftKeeper startup and must fail the suite, not be silently skipped.
         diag = _keeper_diagnostics()
+        if _reference_keeper_works():
+            _safe_shutdown()
+            raise Exception(
+                f"ClickHouse Keeper cluster is available, but cluster.start() failed - this looks "
+                f"like a RaftKeeper-side startup failure and must not be skipped: {ex}\n"
+                f"load: {load_status}\n{diag}") from ex
         _safe_shutdown()
         pytest.skip(f"ClickHouse Keeper cluster unavailable: {ex}\nload: {load_status}\n{diag}")
     try:

@@ -938,11 +938,18 @@ struct StoreRequestSet final : public StoreRequest
             if (bump_parent)
                 ++parent->stat.cversion;
 
-            undo = [prev_node, &store, path = request_typed.path, parent, bump_parent, prev_parent_cversion]
+            /// Resolve the parent by path at undo time: a later failed multi may have removed the
+            /// parent and restored it from a clone (see StoreRequestRemoveRecursive), so the node
+            /// object captured here is not necessarily the one in the tree when the undo runs.
+            undo = [prev_node, &store, path = request_typed.path, parent_path = getParentPath(request_typed.path), bump_parent,
+                    prev_parent_cversion]
             {
                 store.addNode(path, prev_node);
                 if (bump_parent)
-                    parent->stat.cversion = prev_parent_cversion;
+                {
+                    if (auto live_parent = store.getNode(parent_path))
+                        live_parent->stat.cversion = prev_parent_cversion;
+                }
             };
 #endif
         }
@@ -2071,6 +2078,13 @@ void KeeperStore::cleanEphemeralNodes(int64_t session_id, ThreadSafeQueue<Respon
             {
                 --parent->stat.numChildren;
                 parent->children.erase(getBaseName(ephemeral_path));
+#ifndef COMPATIBLE_MODE_ZOOKEEPER
+                /// ClickHouse Keeper counts removals in the parent's cversion (as StoreRequestRemove
+                /// does for an explicit delete); an ephemeral expiry must advance it too.
+                /// In ZK mode the visible cversion is reconstructed in statForResponse from
+                /// cversion/numChildren, so the stored value must stay untouched here.
+                ++parent->stat.cversion;
+#endif
             }
             data_tree.erase(ephemeral_path);
 

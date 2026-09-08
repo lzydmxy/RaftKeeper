@@ -49,17 +49,38 @@ def _maybe_load_keeper_image():
     return f"docker load rc={r.returncode}: {(r.stdout + r.stderr).strip()[:300]}"
 
 
+def _keeper_compose_up():
+    """Bring up (only) the reference ClickHouse Keeper container via compose. Returns (rc, output)."""
+    r = subprocess.run(cluster.base_clickhouse_keeper_cmd + ['up', '-d', '--force-recreate'],
+                       capture_output=True, text=True,
+                       env={**os.environ, 'CH_KEEPER_CONFIG': cluster.clickhouse_keeper_config_path})
+    return r.returncode, f"$ compose up rc={r.returncode}\n{r.stdout}{r.stderr}"
+
+
+def _reference_keeper_works():
+    """Can the reference ClickHouse Keeper actually run here? Retry its bring-up and probe a real
+    client connection. Used to decide skip-vs-fail after cluster.start() fails: only a verified
+    reference-side failure may skip; a RaftKeeper-side failure must fail the suite (this job is the
+    only integration coverage for the ClickHouse-mode build)."""
+    try:
+        rc, out = _keeper_compose_up()
+        print(out)
+        if rc != 0:
+            return False
+        cluster.wait_clickhouse_keeper_to_start(30)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"reference keeper probe failed: {e}")
+        return False
+
+
 def _keeper_diagnostics():
-    """Collect why the ClickHouse Keeper couldn't start, for the skip message."""
+    """Collect why the ClickHouse Keeper couldn't start, for the skip/fail message."""
     out = []
     for cmd in (['docker', 'images'], ['docker', 'ps', '-a']):
         r = subprocess.run(cmd, capture_output=True, text=True)
         out.append(f"$ {' '.join(cmd)}\n{r.stdout}{r.stderr}")
     try:
-        r = subprocess.run(cluster.base_clickhouse_keeper_cmd + ['up', '-d', '--force-recreate'],
-                           capture_output=True, text=True,
-                           env={**os.environ, 'CH_KEEPER_CONFIG': cluster.clickhouse_keeper_config_path})
-        out.append(f"$ compose up rc={r.returncode}\n{r.stdout}{r.stderr}")
         logs = subprocess.run(['docker', 'logs', cluster.get_instance_docker_id('ch_keeper1')],
                               capture_output=True, text=True)
         out.append(f"$ ch_keeper1 logs\n{logs.stdout}{logs.stderr}")
@@ -111,10 +132,17 @@ def started_cluster():
     try:
         cluster.start()
     except Exception as ex:
-        # This suite needs a real ClickHouse Keeper container. If the environment can't provide its
-        # image (e.g. no registry egress from the docker-in-docker daemon), skip rather than fail the
-        # whole integration matrix - RaftKeeper's own startup is covered by other tests.
+        # This suite needs a real ClickHouse Keeper container. Skip only when the failure is
+        # verifiably on the reference side (e.g. no registry egress from the docker-in-docker
+        # daemon). If the reference keeper works, the failure came from RaftKeeper startup and
+        # must fail the suite - otherwise a ClickHouse-mode regression would be silently skipped.
         diag = _keeper_diagnostics()
+        if _reference_keeper_works():
+            _safe_shutdown()
+            raise Exception(
+                f"ClickHouse Keeper is available, but cluster.start() failed - this looks like a "
+                f"RaftKeeper-side startup failure and must not be skipped: {ex}\n"
+                f"load: {load_status}\n{diag}") from ex
         _safe_shutdown()
         pytest.skip(f"ClickHouse Keeper unavailable: {ex}\nload: {load_status}\n{diag}")
     try:
@@ -228,6 +256,35 @@ def test_check_stat_behavioral_parity(clients):
                             label="check_stat missing node")
     finally:
         _cleanup(clients, '/cs')
+
+
+def test_transaction_check_stat(clients):
+    # Regression: TransactionRequestExt.check_stat must serialize CheckStat with the full stat
+    # tuple (it used to pass the 3 convenience args positionally and crash with TypeError before
+    # ever sending anything). The check must then gate the transaction atomically on both servers.
+    raft, ch = clients
+
+    def setup(zk):
+        zk.create('/txcs', b'v1')
+    _setup(clients, setup)
+    try:
+        def build_good(t, zk):
+            st = zk.exists('/txcs')
+            t.check_stat('/txcs', version=st.version, cversion=st.cversion)
+            t.set_data('/txcs', b'v2')
+        assert _run_tx(raft, lambda t: build_good(t, raft)) \
+            == _run_tx(ch, lambda t: build_good(t, ch)), "check_stat-gated txn outcome differs"
+        assert_same_outcome(clients, lambda zk: zk.get('/txcs')[0] == b'v2', label="txn applied")
+
+        def build_bad(t):
+            t.check_stat('/txcs', version=999)
+            t.set_data('/txcs', b'v3')
+        assert _run_tx(raft, build_bad) == _run_tx(ch, build_bad), \
+            "check_stat-mismatched txn outcome differs"
+        # The mismatch must abort the transaction on both: value stays 'v2'.
+        assert_same_outcome(clients, lambda zk: zk.get('/txcs')[0] == b'v2', label="txn aborted")
+    finally:
+        _cleanup(clients, '/txcs')
 
 
 def test_remove_recursive_rejects_root(clients):
@@ -351,6 +408,40 @@ def test_multi_write_rollback_on_failure(clients):
         assert_same_outcome(clients, lambda zk: zk.exists('/mw_rb/new') is None, label="rollback new absent")
     finally:
         _cleanup(clients, '/mw_rb')
+
+
+def test_multi_rollback_restores_parent_cversion(clients):
+    # Regression (RaftKeeper ClickHouse mode): in a failed multi, the child Set's undo must restore
+    # the parent cversion on the *live* tree node. The RemoveRecursive undo re-adds the removed
+    # subtree from clones, so an undo acting on the parent object captured at process time would
+    # silently leak the cversion bump. Assert behavioral parity: after the failed transaction the
+    # subtree is back with its original stat counters on both servers.
+    raft, ch = clients
+
+    def setup(zk):
+        zk.create('/mrpc')
+        zk.create('/mrpc/b', b'orig')
+    _setup(clients, setup)
+    try:
+        before = {name: (zk.exists('/mrpc').cversion, zk.get('/mrpc/b')[1].version)
+                  for zk, name in ((raft, 'raft'), (ch, 'ch'))}
+
+        def build(t):
+            t.set_data('/mrpc/b', b'changed')                   # bumps /mrpc cversion (CH-mode)
+            t.remove_recursive('/mrpc', remove_nodes_limit=100)  # removes + bumps '/' cversion
+            t.check('/mrpc/b', 999)                              # fails -> full rollback
+        assert _run_tx(raft, build) == _run_tx(ch, build), "rollback outcome differs"
+
+        for zk, name in ((raft, 'raft'), (ch, 'ch')):
+            assert zk.get('/mrpc/b')[0] == b'orig', f"{name}: data not rolled back"
+            st_parent = zk.exists('/mrpc')
+            assert st_parent is not None, f"{name}: /mrpc missing after rollback"
+            assert st_parent.cversion == before[name][0], \
+                f"{name}: parent cversion leaked: before={before[name][0]} after={st_parent.cversion}"
+            assert zk.get('/mrpc/b')[1].version == before[name][1], \
+                f"{name}: child version leaked: before={before[name][1]}"
+    finally:
+        _cleanup(clients, '/mrpc')
 
 
 def test_multi_check_and_set_cas(clients):
@@ -519,3 +610,43 @@ def test_ephemeral_session_cleanup(clients):
             assert main.exists(f'/eph_{name}') is None, f"{name}: ephemeral not cleaned up after session close"
     finally:
         close_zk_clients([c for c in (raft_owner, ch_owner) if c is not None])
+
+
+def test_ephemeral_expiry_advances_parent_cversion(clients):
+    # Regression (RaftKeeper ClickHouse mode): the expiry path (cleanEphemeralNodes) decremented
+    # the parent's numChildren but never advanced its cversion, while ClickHouse Keeper advances it
+    # exactly like an explicit child removal. Compare the cversion delta across the expiry on both.
+    raft, ch = clients
+    raft_owner = get_raftkeeper()
+    ch_owner = get_clickhouse_keeper()
+    try:
+        before = {}
+        for main, owner, name in ((raft, raft_owner, 'raft'), (ch, ch_owner, 'ch')):
+            main.create(f'/eph_cv_{name}')
+            before[name] = main.exists(f'/eph_cv_{name}').cversion
+            owner.create(f'/eph_cv_{name}/child', ephemeral=True)
+            # Sanity: creating the child advanced the parent cversion by exactly one on both.
+            assert main.exists(f'/eph_cv_{name}').cversion - before[name] == 1, \
+                f"{name}: parent cversion did not advance by 1 on ephemeral create"
+        before = {name: main.exists(f'/eph_cv_{name}').cversion
+                  for main, name in ((raft, 'raft'), (ch, 'ch'))}
+
+        # Ending the owning session removes the ephemeral child on both servers.
+        close_zk_clients([raft_owner, ch_owner])
+        raft_owner = ch_owner = None
+
+        deltas = {}
+        for main, name in ((raft, 'raft'), (ch, 'ch')):
+            deadline = time.time() + 60
+            while time.time() < deadline and main.exists(f'/eph_cv_{name}/child') is not None:
+                time.sleep(0.5)
+            assert main.exists(f'/eph_cv_{name}/child') is None, \
+                f"{name}: ephemeral not cleaned up after session close"
+            deltas[name] = main.exists(f'/eph_cv_{name}').cversion - before[name]
+
+        assert deltas['raft'] == deltas['ch'] == 1, \
+            f"parent cversion advance on ephemeral expiry differs or is missing: {deltas}"
+    finally:
+        close_zk_clients([c for c in (raft_owner, ch_owner) if c is not None])
+        _cleanup(clients, '/eph_cv_raft')
+        _cleanup(clients, '/eph_cv_ch')

@@ -728,6 +728,124 @@ TEST(RaftStateMachine, RemoveRecursive)
     cleanDirectory(log_dir);
 }
 
+TEST(RaftStateMachine, EphemeralCleanupBumpsParentCversion)
+{
+    String snap_dir(SNAP_DIR + "/eph_cv");
+    String log_dir(LOG_DIR + "/eph_cv");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+
+    setNode(machine.getStore(), "eph_parent", "p", false, session_id);
+    int32_t cversion_before = machine.getStore().getNode("/eph_parent")->stat.cversion;
+
+    /// Creating the ephemeral child bumps the parent cversion by exactly 1 in both modes
+    /// (in ZooKeeper mode the visible value is reconstructed from the stored counters).
+    setNode(machine.getStore(), "eph_parent/eph_child", "c", true, session_id);
+    ASSERT_EQ(machine.getStore().getNode("/eph_parent")->stat.cversion, cversion_before + 1);
+
+    /// Closing the session removes the ephemeral child.
+    auto close_req = cs_new<ZooKeeperCloseRequest>();
+    close_req->xid = 2;
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(response_queue, {close_req, session_id, time}, {}, true, false);
+
+    ASSERT_EQ(machine.getStore().getNode("/eph_parent/eph_child"), nullptr);
+
+    /// The ephemeral expiry must advance the parent's cversion the same way an explicit child
+    /// removal does. In ZooKeeper mode the stored cversion only counts creates (the visible value
+    /// is rebuilt in statForResponse), so there is no stored bump; in ClickHouse mode the stored
+    /// value itself counts removals, and skipping the bump here used to leave a stale cversion.
+#ifdef COMPATIBLE_MODE_ZOOKEEPER
+    ASSERT_EQ(machine.getStore().getNode("/eph_parent")->stat.cversion, cversion_before + 1);
+#else
+    ASSERT_EQ(machine.getStore().getNode("/eph_parent")->stat.cversion, cversion_before + 2);
+#endif
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+
+#ifndef COMPATIBLE_MODE_ZOOKEEPER
+TEST(RaftStateMachine, MultiRollbackRestoresParentCversion)
+{
+    /// ClickHouse-mode only: a child Set bumps the parent's cversion, and Set's undo must restore
+    /// it on the *live* tree node. A later RemoveRecursive in the same multi removes the parent and
+    /// its undo re-adds a clone, so undo that writes to the parent object captured at process time
+    /// would leak the cversion bump (regression: captured stale parent pointer in StoreRequestSet).
+    String snap_dir(SNAP_DIR + "/multi_rb_cv");
+    String log_dir(LOG_DIR + "/multi_rb_cv");
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+
+    KeeperResponsesQueue queue;
+    RaftSettingsPtr setting_ptr = RaftSettings::getDefault();
+    std::mutex new_session_id_callback_mutex;
+    std::unordered_map<int64_t, ptr<std::condition_variable>> new_session_id_callback;
+
+    NuRaftStateMachine machine(queue, setting_ptr, snap_dir, log_dir, 10, 3, new_session_id_callback_mutex, new_session_id_callback);
+    int64_t session_id = machine.getStore().getSessionID(30000);
+
+    setNode(machine.getStore(), "a", "root", false, session_id);
+    setNode(machine.getStore(), "a/b", "child", false, session_id);
+    /// Captured before the multi; the failing transaction below must restore exactly these values.
+    int32_t root_cversion_before = machine.getStore().getNode("/")->stat.cversion;
+    int32_t a_cversion_before = machine.getStore().getNode("/a")->stat.cversion;
+
+    auto set_req = cs_new<ZooKeeperSetRequest>();
+    set_req->path = "/a/b";
+    set_req->data = "changed";
+    set_req->version = -1;
+
+    auto rr_req = cs_new<ZooKeeperRemoveRecursiveRequest>();
+    rr_req->path = "/a";
+
+    /// Guaranteed-failing last op: Remove a path deleted by the RemoveRecursive above.
+    auto rm_req = cs_new<ZooKeeperRemoveRequest>();
+    rm_req->path = "/a/b";
+    rm_req->version = -1;
+
+    auto multi_req = cs_new<ZooKeeperMultiRequest>();
+    multi_req->requests = {set_req, rr_req, rm_req};
+    multi_req->xid = 1;
+
+    KeeperStore::KeeperResponsesQueue response_queue;
+    int64_t time = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
+    machine.getStore().processRequest(response_queue, {multi_req, session_id, time}, {}, true, false);
+
+    ResponseForSession r;
+    ASSERT_TRUE(response_queue.tryPop(r));
+    /// The multi fails and rolls back.
+    ASSERT_EQ(r.response->error, Error::ZOK);
+    auto & multi_resp = dynamic_cast<ZooKeeperMultiResponse &>(*r.response);
+    ASSERT_EQ(multi_resp.responses[2]->error, Error::ZNONODE);
+
+    /// The tree must be byte-identical to the pre-multi state: nodes back with original data...
+    auto a_node = machine.getStore().getNode("/a");
+    auto ab_node = machine.getStore().getNode("/a/b");
+    ASSERT_TRUE(a_node != nullptr);
+    ASSERT_TRUE(ab_node != nullptr);
+    ASSERT_EQ(ab_node->data, "child");
+
+    /// ...including cversions: /a's Set-bump and /'s RemoveRecursive-bump both rolled back.
+    ASSERT_EQ(a_node->stat.cversion, a_cversion_before);
+    ASSERT_EQ(machine.getStore().getNode("/")->stat.cversion, root_cversion_before);
+
+    machine.shutdown();
+    cleanDirectory(snap_dir);
+    cleanDirectory(log_dir);
+}
+#endif
+
 TEST(RaftStateMachine, TryRemove)
 {
     String snap_dir(SNAP_DIR + "/tryrem");
