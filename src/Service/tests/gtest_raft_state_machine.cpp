@@ -160,7 +160,14 @@ TEST(RaftStateMachine, createSnapshot)
     UInt64 term = 1;
     snapshot meta(last_index, term, config);
     machine.create_snapshot(meta);
+    /// 35 created nodes + "/" + mode-dependent system nodes (see KeeperStore::initializeSystemNodes):
+    /// 2 (/zookeeper, /zookeeper/config) in ZooKeeper mode,
+    /// 3 (/keeper, /keeper/api_version, /keeper/feature_flags) in ClickHouse mode.
+#ifdef COMPATIBLE_MODE_ZOOKEEPER
     ASSERT_EQ(machine.getStore().getNodesCount(), 38);
+#else
+    ASSERT_EQ(machine.getStore().getNodesCount(), 39);
+#endif
     machine.shutdown();
 
     cleanDirectory(snap_dir);
@@ -213,7 +220,13 @@ TEST(RaftStateMachine, syncSnapshot)
         machine_target.save_logical_snp_obj(meta, obj_id, *(data_out.get()), is_first, is_last_obj);
     }
     machine_target.apply_snapshot(meta);
+    /// Mode-dependent system nodes: 2 (/zookeeper, /zookeeper/config) in ZooKeeper mode ->
+    /// created + "/" + 2 = last_index + 3; 3 in ClickHouse mode -> last_index + 4.
+#ifdef COMPATIBLE_MODE_ZOOKEEPER
     ASSERT_EQ(machine_target.getStore().getNodesCount(), last_index + 3);
+#else
+    ASSERT_EQ(machine_target.getStore().getNodesCount(), last_index + 4);
+#endif
 
     for (auto i = 1; i < obj_id; i++)
     {
@@ -280,7 +293,13 @@ TEST(RaftStateMachine, initStateMachine)
         LOG_INFO(log, "get sm/tm last commit index {},{}", machine.last_commit_index(), machine.getLastCommittedIndex());
 
 
+        /// Mode-dependent system nodes: ZooKeeper mode -> 256 created + "/" + 2 = 259;
+        /// ClickHouse mode -> 256 created + "/" + 3 = 260.
+#ifdef COMPATIBLE_MODE_ZOOKEEPER
         ASSERT_EQ(machine.getStore().getNodesCount(), 259);
+#else
+        ASSERT_EQ(machine.getStore().getNodesCount(), 260);
+#endif
         machine.shutdown();
     }
 
