@@ -82,8 +82,8 @@ void RaftSettings::loadFromConfig(const String & config_elem, const Poco::Util::
         max_stored_snapshots = config.getUInt(get_key("max_stored_snapshots"), 3);
         /// Log compaction is handled by compactLogStore() in NuRaftStateMachine,
         /// which compacts based on the oldest retained snapshot (same as ZooKeeper).
-        /// NuRaft's own compaction (based on latest snapshot - reserved_log_items)
-        /// is disabled by defaulting reserved_log_items to INT32_MAX so it never fires.
+        /// INT32_MAX postpones NuRaft's additional compaction (latest snapshot - reserved_log_items),
+        /// but is not a disable flag: sufficiently large snapshot indices still trigger it.
         reserved_log_items = config.getUInt(get_key("reserved_log_items"), std::numeric_limits<int32_t>::max());
         startup_timeout = config.getUInt(get_key("startup_timeout"), 6000000);
         shutdown_timeout = config.getUInt(get_key("shutdown_timeout"), 5000);
@@ -137,7 +137,7 @@ RaftSettingsPtr RaftSettings::getDefault()
     settings->client_req_timeout_ms = settings->operation_timeout_ms;
     settings->election_timeout_lower_bound_ms = Coordination::ELECTION_TIMEOUT_LOWER_BOUND_MS;
     settings->election_timeout_upper_bound_ms = Coordination::ELECTION_TIMEOUT_UPPER_BOUND_MS;
-    settings->reserved_log_items = std::numeric_limits<int32_t>::max(); /// disabled — compaction handled by compactLogStore() (ZooKeeper-style)
+    settings->reserved_log_items = std::numeric_limits<int32_t>::max(); /// Prefer oldest-retained-snapshot compaction; not a disable flag.
     settings->snapshot_distance = 3000000;
     settings->max_stored_snapshots = 3;
     settings->shutdown_timeout = 5000;

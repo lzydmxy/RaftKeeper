@@ -11,6 +11,7 @@
 
 #include <Common/Exception.h>
 #include <Common/Stopwatch.h>
+#include <common/scope_guard.h>
 #include <fmt/format.h>
 
 #include <Service/Crc32.h>
@@ -717,6 +718,7 @@ void KeeperSnapshotStore::saveObject(ulong obj_id, buffer & buffer)
     getObjectPath(obj_id, obj_path);
 
     int snap_fd = openFileForWrite(obj_path);
+    SCOPE_EXIT({ ::close(snap_fd); });
 
     buffer.pos(0);
     size_t offset = 0;
@@ -733,20 +735,42 @@ void KeeperSnapshotStore::saveObject(ulong obj_id, buffer & buffer)
         }
         errno = 0;
         ssize_t ret = pwrite(snap_fd, buffer.get_raw(buf_size), buf_size, offset);
-        if (ret < 0)
+        if (ret != buf_size)
         {
             throwFromErrno(ErrorCodes::CANNOT_WRITE_TO_FILE_DESCRIPTOR, "Fail to write a snapshot file {}", obj_path);
         }
         offset += buf_size;
     }
 
-    if (snap_fd > 0)
-    {
-        ::close(snap_fd);
-    }
-
     objects_path[obj_id] = obj_path;
     LOG_INFO(log, "Save object path {}, file size {}, obj_id {}.", obj_path, buffer.size(), obj_id);
+}
+
+void KeeperSnapshotStore::sync()
+{
+    if (durable)
+        return;
+    for (const auto & [id, path] : objects_path)
+    {
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0)
+            throwFromErrno(ErrorCodes::CORRUPTED_SNAPSHOT, "Cannot open snapshot object {} for sync", path);
+        SCOPE_EXIT({ ::close(fd); });
+        if (::fsync(fd) != 0)
+            throwFromErrno(ErrorCodes::CANNOT_WRITE_TO_FILE_DESCRIPTOR, "Cannot sync snapshot object {}", path);
+    }
+    /// Sync both directory contents and its entry in the parent (the directory may be new).
+    for (const auto & path : {std::filesystem::path(snap_dir), std::filesystem::path(snap_dir).parent_path()})
+    {
+        const auto directory = path.empty() ? std::filesystem::path(".") : path;
+        int fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
+        if (fd < 0)
+            throwFromErrno(ErrorCodes::CORRUPTED_SNAPSHOT, "Cannot open snapshot directory {}", directory.string());
+        SCOPE_EXIT({ ::close(fd); });
+        if (::fsync(fd) != 0)
+            throwFromErrno(ErrorCodes::CANNOT_WRITE_TO_FILE_DESCRIPTOR, "Cannot sync snapshot directory {}", directory.string());
+    }
+    durable = true;
 }
 
 void KeeperSnapshotStore::addObjectPath(ulong obj_id, String & path)
@@ -773,6 +797,7 @@ size_t KeeperSnapshotManager::createSnapshotAsync(SnapTask & snap_task, Snapshot
         snap_task.next_session_id,
         snap_task.next_zxid);
     size_t obj_size = snap_store->createObjectsAsync(snap_task);
+    snap_store->sync();
     snapshots[getSnapshotStoreMapKey(*meta)] = snap_store;
     return obj_size;
 }
@@ -797,6 +822,7 @@ size_t KeeperSnapshotManager::createSnapshot(
         next_session_id,
         next_zxid);
     size_t obj_size = snap_store->createObjects(store, next_zxid, next_session_id);
+    snap_store->sync();
     snapshots[getSnapshotStoreMapKey(meta)] = snap_store;
     return obj_size;
 }
@@ -805,17 +831,19 @@ bool KeeperSnapshotManager::receiveSnapshotMeta(snapshot & meta)
 {
     ptr<KeeperSnapshotStore> snap_store = cs_new<KeeperSnapshotStore>(snap_dir, meta, object_node_size);
     snap_store->init();
-    snapshots[getSnapshotStoreMapKey(meta)] = snap_store;
+    receiving_snapshots[getSnapshotStoreMapKey(meta)] = snap_store;
     return true;
 }
 
 bool KeeperSnapshotManager::existSnapshot(const snapshot & meta) const
 {
-    return snapshots.find(getSnapshotStoreMapKey(meta)) != snapshots.end();
+    return snapshots.contains(getSnapshotStoreMapKey(meta)) || receiving_snapshots.contains(getSnapshotStoreMapKey(meta));
 }
 
 bool KeeperSnapshotManager::existSnapshotObject(const snapshot & meta, ulong obj_id) const
 {
+    if (auto pending = receiving_snapshots.find(getSnapshotStoreMapKey(meta)); pending != receiving_snapshots.end())
+        return pending->second->existObject(obj_id);
     auto it = snapshots.find(getSnapshotStoreMapKey(meta));
     if (it == snapshots.end())
     {
@@ -847,14 +875,14 @@ bool KeeperSnapshotManager::loadSnapshotObject(const snapshot & meta, ulong obj_
 
 bool KeeperSnapshotManager::saveSnapshotObject(snapshot & meta, ulong obj_id, buffer & buffer)
 {
-    auto it = snapshots.find(getSnapshotStoreMapKey(meta));
+    auto it = receiving_snapshots.find(getSnapshotStoreMapKey(meta));
     ptr<KeeperSnapshotStore> store;
-    if (it == snapshots.end())
+    if (it == receiving_snapshots.end())
     {
         meta.set_size(0);
         store = cs_new<KeeperSnapshotStore>(snap_dir, meta);
         store->init();
-        snapshots[getSnapshotStoreMapKey(meta)] = store;
+        receiving_snapshots[getSnapshotStoreMapKey(meta)] = store;
     }
     else
     {
@@ -866,6 +894,11 @@ bool KeeperSnapshotManager::saveSnapshotObject(snapshot & meta, ulong obj_id, bu
 
 bool KeeperSnapshotManager::parseSnapshot(const snapshot & meta, KeeperStore & storage)
 {
+    if (auto pending = receiving_snapshots.find(getSnapshotStoreMapKey(meta)); pending != receiving_snapshots.end())
+    {
+        pending->second->loadLatestSnapshot(storage);
+        return true;
+    }
     auto it = snapshots.find(getSnapshotStoreMapKey(meta));
     if (it == snapshots.end())
     {
@@ -876,9 +909,29 @@ bool KeeperSnapshotManager::parseSnapshot(const snapshot & meta, KeeperStore & s
     return true;
 }
 
+void KeeperSnapshotManager::confirmSnapshot(const snapshot & meta)
+{
+    const auto key = getSnapshotStoreMapKey(meta);
+    if (auto it = receiving_snapshots.find(key); it != receiving_snapshots.end())
+    {
+        it->second->sync();
+        snapshots[key] = it->second;
+        receiving_snapshots.erase(it);
+    }
+    else
+        snapshots.at(key)->sync();
+}
+
+void KeeperSnapshotManager::discardInvalidSnapshot(const snapshot & meta)
+{
+    /// Leave the files untouched for diagnosis; they must not count toward retention pruning.
+    snapshots.erase(getSnapshotStoreMapKey(meta));
+}
+
 size_t KeeperSnapshotManager::loadSnapshotMetas()
 {
     snapshots.clear();
+    receiving_snapshots.clear();
 
     Poco::File file_dir(snap_dir);
 
@@ -931,61 +984,38 @@ ptr<snapshot> KeeperSnapshotManager::lastSnapshot()
 
 size_t KeeperSnapshotManager::removeSnapshots()
 {
-    Int64 remove_count = static_cast<Int64>(snapshots.size()) - static_cast<Int64>(keep_max_snapshot_count);
+    const auto keep = std::max<UInt32>(1, keep_max_snapshot_count);
+    /// Unverified startup snapshots still protect their logs, but must not evict known-good
+    /// snapshots. Wait until enough durable snapshots exist before pruning the catalog.
+    auto durable_count = std::count_if(snapshots.begin(), snapshots.end(), [](const auto & item) { return item.second->isDurable(); });
+    if (durable_count < keep)
+        return snapshots.size();
 
-    LOG_INFO(log, "There are {} snapshots, we will try to move {} of them", snapshots.size(), remove_count);
-
-    while (remove_count > 0)
+    while (snapshots.size() > keep)
     {
         auto it = snapshots.begin();
-        uint128_t remove_term_log_index = it->first;
-        auto [log_term, log_index] = getTermLogFromSnapshotStoreMapKey(remove_term_log_index);
-        LOG_INFO(log, "Remove snapshot with term {} log index {}", log_term, log_index);
-
-        Poco::File dir_obj(snap_dir);
-        if (dir_obj.exists())
+        try
         {
-            std::vector<String> files;
-            dir_obj.list(files);
-            for (const auto & file : files)
+            for (const auto & [id, path] : it->second->getObjectPaths())
             {
-                if (file.find("snapshot_") == file.npos)
-                {
-                    LOG_INFO(log, "Skip no snapshot file {}", file);
-                    continue;
-                }
-
-                SnapObject s_obj;
-                if (!s_obj.parseInfoFromObjectName(file))
-                    continue;
-
-                auto key = getSnapshotStoreMapKey(s_obj);
-                if (remove_term_log_index == key)
-                {
-                    LOG_INFO(
-                        log,
-                        "remove_count {}, snapshot size {}, remove term with term {} log index {}, file {}",
-                        remove_count,
-                        snapshots.size(),
-                        log_term,
-                        log_index,
-                        file);
-                    Poco::File(snap_dir + "/" + file).remove();
-                    if (snapshots.find(key) != snapshots.end())
-                    {
-                        snapshots.erase(it);
-                    }
-                }
+                if (Poco::File(path).exists())
+                    Poco::File(path).remove();
             }
+            int fd = ::open(snap_dir.c_str(), O_RDONLY | O_DIRECTORY);
+            if (fd < 0)
+                throwFromErrno(ErrorCodes::CORRUPTED_SNAPSHOT, "Cannot open snapshot directory {}", snap_dir);
+            SCOPE_EXIT({ ::close(fd); });
+            if (::fsync(fd) != 0)
+                throwFromErrno(ErrorCodes::CANNOT_WRITE_TO_FILE_DESCRIPTOR, "Cannot sync snapshot removal in {}", snap_dir);
+            snapshots.erase(it);
         }
-        remove_count--;
+        catch (...)
+        {
+            /// Keep the whole catalog entry (and its log protection) until all objects are gone.
+            tryLogCurrentException(log, "Snapshot retention cleanup failed; preserving its log boundary");
+            break;
+        }
     }
-
-    if (snapshots.size() > keep_max_snapshot_count)
-        LOG_ERROR(log, "Snapshots size() is still large than keep_max_snapshot_count {}, it's a bug",
-                  snapshots.size(), keep_max_snapshot_count);
-
     return snapshots.size();
 }
-
 }

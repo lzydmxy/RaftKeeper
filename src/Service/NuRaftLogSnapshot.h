@@ -129,6 +129,8 @@ struct SnapObject
  */
 class KeeperSnapshotStore
 {
+    friend class SnapshotDurabilityTest;
+
 public:
     KeeperSnapshotStore(
         const String & snap_dir_,
@@ -178,6 +180,9 @@ public:
 
     /// save an object
     void saveObject(ulong obj_id, buffer & buffer);
+    /// Authorize use as a reclamation anchor only after every object and directory are durable.
+    void sync();
+    bool isDurable() const { return durable; }
 
     void addObjectPath(ulong obj_id, String & path);
 
@@ -262,6 +267,7 @@ private:
     UInt64 last_log_term;
 
     std::map<ulong, String> objects_path;
+    bool durable = false;
 
     /// Loaded snapshot object count which is read from object1
     /// Added from RaftKeeper v2.2.0
@@ -325,6 +331,8 @@ public:
 
     /// save snapshot meta, invoked when we receive an snapshot from leader.
     bool receiveSnapshotMeta(snapshot & meta);
+    void confirmSnapshot(const snapshot & meta);
+    void discardInvalidSnapshot(const snapshot & meta);
 
     /// save snapshot object, invoked when we receive an snapshot from leader.
     bool saveSnapshotObject(snapshot & meta, ulong obj_id, buffer & buffer);
@@ -364,6 +372,7 @@ private:
     Poco::Logger * log;
 
     KeeperSnapshotStoreMap snapshots;
+    KeeperSnapshotStoreMap receiving_snapshots;
     String last_create_time_str;
 };
 
