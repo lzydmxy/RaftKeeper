@@ -131,12 +131,17 @@ downgradeSnapshot(const String & input_dir, const String & output_dir, SnapshotV
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Input and output directories are required");
 
     auto input = fs::canonical(input_dir);
-    auto output = fs::weakly_canonical(fs::absolute(output_dir));
+    auto requested_output = fs::absolute(output_dir);
+    while (requested_output != requested_output.root_path() && requested_output.filename().empty())
+        requested_output = requested_output.parent_path();
+    auto output = fs::weakly_canonical(requested_output);
+    while (output != output.root_path() && output.filename().empty())
+        output = output.parent_path();
     if (!fs::is_directory(input) || !fs::is_directory(output.parent_path()))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Input and output parent must be existing directories");
     if (isWithin(input, output) || isWithin(output, input))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Input and output directories must not overlap");
-    if (fs::exists(fs::symlink_status(output_dir)) || fs::is_symlink(fs::symlink_status(output_dir)))
+    if (fs::exists(fs::symlink_status(requested_output)) || fs::is_symlink(fs::symlink_status(requested_output)))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Output directory must not exist: {}", output_dir);
 
     auto snapshots = findSnapshots(input);
@@ -185,7 +190,7 @@ downgradeSnapshot(const String & input_dir, const String & output_dir, SnapshotV
     for (auto & [id, path] : source.objects)
         reader.addObjectPath(id, path);
     KeeperStore store(500);
-    reader.loadLatestSnapshot(store, /*require_object_count=*/true);
+    reader.loadLatestSnapshot(store, /*require_complete_state=*/true);
 
     String staging = (output.parent_path() / (output.filename().string() + ".tmp.XXXXXX")).string();
     if (!::mkdtemp(staging.data()))
@@ -204,7 +209,7 @@ downgradeSnapshot(const String & input_dir, const String & output_dir, SnapshotV
     writer.init(identity.create_time);
     auto count = writer.createObjects(store, store.getZxid(), store.getSessionIDCounter());
     KeeperStore restored(500);
-    writer.loadLatestSnapshot(restored, /*require_object_count=*/true);
+    writer.loadLatestSnapshot(restored, /*require_complete_state=*/true);
     verifyState(store, restored);
     publishDirectory(staging, output.string());
     published = true;

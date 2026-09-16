@@ -1,9 +1,12 @@
 #pragma once
 
-#include <Service/SnapshotCommon.h>
-#include <Service/Metrics.h>
-#include <Common/Stopwatch.h>
+#include <atomic>
 #include <charconv>
+
+#include <Common/Stopwatch.h>
+
+#include <Service/Metrics.h>
+#include <Service/SnapshotCommon.h>
 
 
 namespace RK
@@ -169,8 +172,8 @@ public:
     /// initialize a snapshot store
     void init(const String & create_time  = "");
 
-    /// Load the latest snapshot object.
-    void loadLatestSnapshot(KeeperStore & store, bool require_object_count = false);
+    /// Strict conversion loads require counters, object count and an explicit root node.
+    void loadLatestSnapshot(KeeperStore & store, bool require_complete_state = false);
 
     /// load on object of the latest snapshot
     void loadObject(ulong obj_id, ptr<buffer> & buffer);
@@ -272,6 +275,8 @@ private:
     /// Loaded snapshot object count which is read from object1
     /// Added from RaftKeeper v2.2.0
     std::optional<UInt32> loaded_objects_count;
+    std::atomic<bool> loaded_zxid{false};
+    std::atomic<bool> loaded_session_id{false};
 
     std::vector<BucketEdges> all_objects_edges;
     std::vector<BucketNodes> all_objects_nodes;

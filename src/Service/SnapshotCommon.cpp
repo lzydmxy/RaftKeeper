@@ -545,7 +545,7 @@ void parseBatchAclMapV2(KeeperStore & store, SnapshotBatchBody & batch, Snapshot
     }
 }
 
-void parseBatchIntMapV2(KeeperStore & store, std::optional<UInt32> & object_count, SnapshotBatchBody & batch, SnapshotVersion /*version*/)
+IntMap parseBatchIntMapV2(KeeperStore & store, std::optional<UInt32> & object_count, SnapshotBatchBody & batch, SnapshotVersion /*version*/)
 {
     IntMap int_map;
     for (size_t i = 0; i < batch.size(); i++)
@@ -579,6 +579,7 @@ void parseBatchIntMapV2(KeeperStore & store, std::optional<UInt32> & object_coun
     {
         object_count = int_map["OBJECTCOUNT"];
     }
+    return int_map;
 }
 
 }

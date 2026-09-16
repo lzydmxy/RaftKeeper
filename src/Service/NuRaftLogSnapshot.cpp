@@ -554,11 +554,16 @@ void KeeperSnapshotStore::parseBatchBodyV2(
             LOG_DEBUG(log, "Parsing batch acl from snapshot, acl count {}", batch->size());
             parseBatchAclMapV2(store, *batch, version_);
             break;
-        case SnapshotBatchType::SNAPSHOT_TYPE_UINTMAP:
+        case SnapshotBatchType::SNAPSHOT_TYPE_UINTMAP: {
             LOG_DEBUG(log, "Parsing batch int_map from snapshot, element count {}", batch->size());
-            parseBatchIntMapV2(store, loaded_objects_count, *batch, version_);
+            auto counters = parseBatchIntMapV2(store, loaded_objects_count, *batch, version_);
+            if (counters.contains("ZXID"))
+                loaded_zxid = true;
+            if (counters.contains("SESSIONID"))
+                loaded_session_id = true;
             LOG_DEBUG(log, "Parsed zxid {}, session_id_counter {}", store.getZxid(), store.getSessionIDCounter());
             break;
+        }
         case SnapshotBatchType::SNAPSHOT_TYPE_CONFIG:
         case SnapshotBatchType::SNAPSHOT_TYPE_SERVER:
             break;
@@ -567,10 +572,12 @@ void KeeperSnapshotStore::parseBatchBodyV2(
     }
 }
 
-void KeeperSnapshotStore::loadLatestSnapshot(KeeperStore & store, bool require_object_count)
+void KeeperSnapshotStore::loadLatestSnapshot(KeeperStore & store, bool require_complete_state)
 {
     size_t objects_cnt = objects_path.size();
     loaded_objects_count.reset();
+    loaded_zxid = false;
+    loaded_session_id = false;
 
     // The object IDs are consecutive starting from 1,
     // so the first number must be 1, and the last number must be the total count.
@@ -611,8 +618,25 @@ void KeeperSnapshotStore::loadLatestSnapshot(KeeperStore & store, bool require_o
     thread_pool.wait();
     LOG_INFO(log, "Parsing snapshot objects costs {}ms", watch.elapsedMilliseconds());
 
-    if (require_object_count && !loaded_objects_count)
+    if (require_complete_state && !loaded_objects_count)
         throw Exception(ErrorCodes::SNAPSHOT_OBJECT_INCOMPLETE, "Snapshot metadata does not contain OBJECTCOUNT");
+
+    if (require_complete_state)
+    {
+        if (!loaded_zxid)
+            throw Exception(ErrorCodes::SNAPSHOT_OBJECT_INCOMPLETE, "Snapshot metadata does not contain ZXID");
+        if (!loaded_session_id)
+            throw Exception(ErrorCodes::SNAPSHOT_OBJECT_INCOMPLETE, "Snapshot metadata does not contain SESSIONID");
+
+        /// Inspect parsed records before the initialized store can supply a default root.
+        bool has_root = false;
+        for (const auto & object_nodes : all_objects_nodes)
+            for (const auto & [path, node] : object_nodes[store.getBucketIndex("/")])
+                if (path == "/")
+                    has_root = true;
+        if (!has_root)
+            throw Exception(ErrorCodes::SNAPSHOT_OBJECT_INCOMPLETE, "Snapshot does not contain root node /");
+    }
 
     if (loaded_objects_count && *loaded_objects_count != objects_path.size())
     {
