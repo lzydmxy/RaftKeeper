@@ -620,6 +620,13 @@ void KeeperSnapshotStore::loadLatestSnapshot(KeeperStore & store, bool require_c
     if (require_complete_state && !loaded_objects_count)
         throw Exception(ErrorCodes::SNAPSHOT_OBJECT_INCOMPLETE, "Snapshot metadata does not contain OBJECTCOUNT");
 
+    if (loaded_objects_count && *loaded_objects_count != objects_path.size())
+    {
+        throw Exception(ErrorCodes::SNAPSHOT_OBJECT_INCOMPLETE,
+            "Loading snapshot objects error, expecting {} objects, got {} objects",
+            *loaded_objects_count, objects_path.size());
+    }
+
     if (require_complete_state)
     {
         if (!loaded_zxid)
@@ -635,13 +642,6 @@ void KeeperSnapshotStore::loadLatestSnapshot(KeeperStore & store, bool require_c
                     has_root = true;
         if (!has_root)
             throw Exception(ErrorCodes::SNAPSHOT_OBJECT_INCOMPLETE, "Snapshot does not contain root node /");
-    }
-
-    if (loaded_objects_count && *loaded_objects_count != objects_path.size())
-    {
-        throw Exception(ErrorCodes::SNAPSHOT_OBJECT_INCOMPLETE,
-            "Loading snapshot objects error, expecting {} objects, got {} objects",
-            *loaded_objects_count, objects_path.size());
     }
 
     LOG_INFO(log, "Building data tree from snapshot objects");

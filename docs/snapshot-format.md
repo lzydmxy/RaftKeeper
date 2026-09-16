@@ -154,6 +154,10 @@ including session/auth/ephemeral preservation using the genuine 2.1.1 binary:
   missing objects, mixed versions, duplicate objects and ambiguous identities.
   Both codecs must fail without fallback, source changes or partial output;
   explicit recovery from an intact older snapshot is also checked.
+- Checksummed uncompressed V4 snapshots missing ZXID, SESSIONID, OBJECTCOUNT or
+  the root record must be rejected without output. CLI directory arguments with
+  trailing separators are converted and restored; existing destinations and
+  dangling symlinks remain rejected.
 - After downgrade, 2.1.1 must allocate sequential nodes, commit transactions,
   allocate new sessions and replay its newly written log tail after restart.
 - Explicit legacy V2/V3 writing transitions to default V4; codec changes and a

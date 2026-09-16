@@ -143,10 +143,10 @@ def test_converter_cli_errors_and_latest_selection(fresh_root):
         client.close()
         original = manifest(node, root + "/snapshots")
         base = ["--raftkeeper-snapshots-dir", root + "/snapshots"]
-        result = converter(node, base + ["--target-snapshot-version", "2", "--output-dir", root + "/latest"])
+        result = converter(node, base + ["--target-snapshot-version", "2", "--output-dir", root + "/latest/"])
         assert result["code"] == 0, result
         assert latest in result["stdout"]
-        result = converter(node, base + ["--target-snapshot-version", "2", "--output-dir", root + "/first", "--snapshot-prefix", first])
+        result = converter(node, base + ["--target-snapshot-version", "2", "--output-dir", root + "/first///", "--snapshot-prefix", first])
         assert result["code"] == 0, result
         assert first in result["stdout"]
         node.exec_in_container([
@@ -160,10 +160,12 @@ def test_converter_cli_errors_and_latest_selection(fresh_root):
             base + ["--target-snapshot-version", "0", "--output-dir", root + "/invalid"],
             base + ["--target-snapshot-version", "4", "--output-dir", root + "/same-version"],
             base + ["--target-snapshot-version", "2", "--output-dir", root + "/latest"],
+            base + ["--target-snapshot-version", "2", "--output-dir", root + "/latest/"],
             base + ["--target-snapshot-version", "2", "--output-dir", root + "/snapshots/child"],
             base + ["--target-snapshot-version", "2", "--output-dir", root + "/source-alias/child"],
             base + ["--target-snapshot-version", "2", "--output-dir", root + "/empty-existing"],
             base + ["--target-snapshot-version", "2", "--output-dir", root + "/dangling"],
+            base + ["--target-snapshot-version", "2", "--output-dir", root + "/dangling/"],
             base + ["--target-snapshot-version", "2", "--output-dir", root + "/missing-parent/output"],
             base + ["--target-snapshot-version", "2", "--output-dir", root + "/missing-prefix", "--snapshot-prefix", "missing"],
             base + ["--target-snapshot-version", "2", "--output-dir", root + "/mixed", "--zookeeper-logs-dir", root],
@@ -227,9 +229,16 @@ def test_corrupt_latest_snapshot_never_falls_back(fresh_root, codec):
             ("duplicate", "Duplicate snapshot object"),
             ("ambiguous", "Ambiguous latest snapshot"),
         ]
+        # Recompute valid checksums after removing individual records. Compressed
+        # missing-record inputs are also covered by SnapshotFormatTest unit tests.
+        if codec == "none":
+            faults += [("missing_zxid", "does not contain ZXID"),
+                       ("missing_sessionid", "does not contain SESSIONID"),
+                       ("missing_objectcount", "does not contain OBJECTCOUNT"),
+                       ("missing_root", "does not contain root node /")]
         damage_script = """
 from pathlib import Path
-import shutil, sys
+import shutil, struct, sys, zlib
 source, destination, prefix, fault = sys.argv[1:]
 shutil.copytree(source, destination)
 root = Path(destination)
@@ -246,6 +255,38 @@ elif fault == 'ambiguous':
     alternate = '_'.join(parts)
     for path in list(root.glob(prefix + '_*')):
         shutil.copyfile(path, root / path.name.replace(prefix, alternate, 1))
+elif fault in ('missing_zxid', 'missing_sessionid', 'missing_objectcount', 'missing_root'):
+    path = data if fault == 'missing_root' else metadata
+    content = path.read_bytes()
+    assert content[:10] == b'SnapHead\\x04\\x00'
+    rewritten = bytearray(content[:16])
+    offset, checksum, removed = 16, 0, 0
+    expected_type = 0 if fault == 'missing_root' else 6
+    key = b'/' if fault == 'missing_root' else fault[len('missing_'):].upper().encode()
+    while offset < len(content) - 12:
+        length, original_crc = struct.unpack_from('<II', content, offset)
+        body = content[offset + 8:offset + 8 + length]
+        assert zlib.crc32(body, 0xffffffff) == original_crc
+        batch_type, count = struct.unpack_from('<ii', body)
+        position, elements = 8, []
+        for _ in range(count):
+            size, = struct.unpack_from('<i', body, position)
+            element = body[position + 4:position + 4 + size]
+            position += 4 + size
+            if batch_type == expected_type and element.startswith(struct.pack('>i', len(key)) + key):
+                removed += 1
+            else:
+                elements.append(element)
+        assert position == len(body)
+        body = struct.pack('<ii', batch_type, len(elements))
+        body += b''.join(struct.pack('<i', len(element)) + element for element in elements)
+        crc = zlib.crc32(body, 0xffffffff)
+        rewritten += struct.pack('<II', len(body), crc) + body
+        checksum = zlib.crc32(struct.pack('<II', checksum, crc), 0xffffffff)
+        offset += 8 + length
+    assert removed == 1 and offset == len(content) - 12
+    rewritten += b'SnapTail' + struct.pack('<I', checksum)
+    path.write_bytes(rewritten)
 else:
     path = data if fault in ('data_crc', 'mixed_versions') else metadata
     content = bytearray(path.read_bytes())
