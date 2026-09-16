@@ -447,6 +447,64 @@ TEST_F(SnapshotFormatTest, DowngradeRequiresCompleteMetadata)
     EXPECT_THROW(downgradeSnapshot(dir + "/source", dir + "/missing-parent/output", SnapshotVersion::V2), RK::Exception);
 }
 
+TEST_F(SnapshotFormatTest, DowngradeRejectsMissingSourceCounters)
+{
+    for (auto codec : {SnapshotCodec::None, SnapshotCodec::Zstd})
+    {
+        for (const String missing : {"ZXID", "SESSIONID", "OBJECTCOUNT"})
+        {
+            SCOPED_TRACE(missing);
+            auto case_dir = dir + "/" + std::to_string(static_cast<uint8_t>(codec)) + missing;
+            SnapshotFormat format{SnapshotVersion::V4, codec};
+            auto paths = writeSource(case_dir + "/source", format);
+            IntMap counters{
+                {"ZXID", store.getZxid()}, {"SESSIONID", store.getSessionIDCounter()}, {"OBJECTCOUNT", static_cast<Int64>(paths.size())}};
+            counters.erase(missing);
+            serializeSnapshotMetadata(
+                counters, store.getSessionAndTimeOut(), store.getSessionAndAuth(), store.getACLMap().getMapping(), 1, format, paths.at(1));
+            for (auto target : {SnapshotVersion::V2, SnapshotVersion::V3})
+            {
+                EXPECT_THROW(downgradeSnapshot(case_dir + "/source", case_dir + "/output", target), RK::Exception);
+                EXPECT_FALSE(std::filesystem::exists(case_dir + "/output"));
+            }
+        }
+    }
+}
+
+TEST_F(SnapshotFormatTest, DowngradeRejectsMissingSourceRoot)
+{
+    store.removeNode("/");
+    for (auto format :
+         {SnapshotFormat{SnapshotVersion::V3},
+          SnapshotFormat{SnapshotVersion::V4, SnapshotCodec::None},
+          SnapshotFormat{SnapshotVersion::V4, SnapshotCodec::Zstd}})
+    {
+        auto case_dir = dir + "/" + toString(format.version) + std::to_string(static_cast<uint8_t>(format.codec));
+        /// The async writer serializes buckets directly, so it can construct a checksummed snapshot without a root.
+        writeSource(case_dir + "/source", format, 77, 7, "20260915010101", /*async=*/true);
+        EXPECT_THROW(downgradeSnapshot(case_dir + "/source", case_dir + "/output", SnapshotVersion::V2), RK::Exception);
+        EXPECT_FALSE(std::filesystem::exists(case_dir + "/output"));
+    }
+}
+
+TEST_F(SnapshotFormatTest, DowngradeAcceptsTrailingOutputSeparators)
+{
+    writeSource(dir + "/source");
+    for (const String suffix : {"/", "///"})
+    {
+        auto output = dir + "/output" + std::to_string(suffix.size());
+        auto result = downgradeSnapshot(dir + "/source", output + suffix, SnapshotVersion::V2);
+        EXPECT_EQ(result.output_dir, std::filesystem::canonical(output).string());
+        EXPECT_THROW(downgradeSnapshot(dir + "/source", output + suffix, SnapshotVersion::V2), RK::Exception);
+        EXPECT_THROW(downgradeSnapshot(dir + "/source", dir + "/missing-parent/output" + suffix, SnapshotVersion::V2), RK::Exception);
+        EXPECT_THROW(downgradeSnapshot(dir + "/source", dir + "/source" + suffix, SnapshotVersion::V2), RK::Exception);
+    }
+    std::filesystem::create_directory_symlink(std::filesystem::absolute(dir + "/absent"), dir + "/symlink");
+    EXPECT_THROW(downgradeSnapshot(dir + "/source", dir + "/symlink/", SnapshotVersion::V2), RK::Exception);
+    EXPECT_FALSE(std::filesystem::exists(dir + "/absent"));
+    EXPECT_THROW(downgradeSnapshot(dir + "/source", "/", SnapshotVersion::V2), RK::Exception);
+}
+
 TEST_F(SnapshotFormatTest, DowngradeEmptySnapshot)
 {
     KeeperStore empty(500);
