@@ -29,6 +29,10 @@ contains:
 - `state-before.json` and `state-after.json`: endpoint state snapshots.
 - `report.json` and `report.md`: parsed benchmark and peak-interval summary.
 
+When `--output-dir` is omitted, each run writes to
+`benchmark-results/<root-name>/<timestamp>`. A non-empty explicit output
+directory is rejected instead of being overwritten.
+
 Use `--profile smoke` for a small validation. Use `--reuse-existing` with an
 explicit `--root-name` to skip prefill for repeated A/B tests. Add
 `--drop-late-requests` when a capacity test should shed overdue offered load

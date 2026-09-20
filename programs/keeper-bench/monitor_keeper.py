@@ -68,7 +68,10 @@ def read_metrics(host, port):
 def trigger_snapshot(host, port, result):
     started = time.monotonic()
     try:
-        result["response"] = send_four_letter(host, port, "csnp", timeout=120).strip()
+        response = send_four_letter(host, port, "csnp", timeout=120).strip()
+        if not response.isdigit():
+            raise RuntimeError(f"Snapshot request failed: {response or 'empty response'}")
+        result["response"] = response
     except Exception as exception:
         result["error"] = repr(exception)
     finally:
@@ -104,18 +107,21 @@ def monitor(args, stop_event=None):
 
             samples = []
             for host, port in servers:
-                row = {
-                    "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
-                    "elapsed_seconds": f"{elapsed:.3f}",
-                    "host": f"{host}:{port}",
-                    "error": "",
-                }
+                metrics = {}
+                error = ""
                 try:
                     metrics = read_metrics(host, port)
-                    for metric in METRICS:
-                        row[metric] = metrics.get(metric, "")
                 except Exception as exception:
-                    row["error"] = repr(exception)
+                    error = repr(exception)
+                sample_time = time.monotonic()
+                row = {
+                    "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                    "elapsed_seconds": f"{sample_time - started:.3f}",
+                    "host": f"{host}:{port}",
+                    "error": error,
+                }
+                for metric in METRICS:
+                    row[metric] = metrics.get(metric, "")
                 samples.append(row)
 
             writer.writerows(samples)
@@ -146,6 +152,12 @@ def monitor(args, stop_event=None):
     if snapshot_thread:
         snapshot_thread.join(timeout=130)
         print(f"snapshot_result={snapshot_result}")
+        if snapshot_thread.is_alive():
+            raise TimeoutError("Snapshot request did not finish within 130 seconds")
+        if "error" in snapshot_result:
+            raise RuntimeError(snapshot_result["error"])
+    elif args.snapshot_at is not None:
+        raise RuntimeError("Benchmark ended before the requested snapshot was triggered")
 
 
 def run_benchmark(args):

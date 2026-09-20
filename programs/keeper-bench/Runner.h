@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <random>
 
 #include <Common/ThreadPool.h>
@@ -128,6 +130,8 @@ private:
     void work(ZooKeeperPtr, size_t thread_id);
     void workImpl(ZooKeeperPtr, size_t thread_id);
     void setupClickHouseWorkload(ZooKeeperPtr zk);
+    void validateClickHouseWorkload(ZooKeeperPtr zk);
+    void shutdownWorkers();
 
     String bench_path;
     size_t bench_cnt;
@@ -149,7 +153,10 @@ private:
     std::atomic<Int64> benchmark_start_ns{0};
     std::atomic<UInt64> dropped_request_slots{0};
     std::atomic<UInt64> max_schedule_lag_us{0};
+    std::condition_variable shutdown_cv;
+    std::mutex shutdown_mutex;
     String hostname;
+    String run_token;
 
 
     std::vector<Coordination::ZooKeeper::Node> nodes;

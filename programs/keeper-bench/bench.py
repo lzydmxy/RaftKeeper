@@ -116,14 +116,24 @@ def generate_report(output_dir, manifest):
     intervals = {}
     snapshot_start = None
     snapshot_end = None
+    snapshot_count = 0
     snapshot_time_ms = 0
     snapshot_blocking_ms = 0
+    snapshot_baseline = None
     first_znode_count = None
     last_znode_count = None
     node_samples = {}
     with (output_dir / "keeper-metrics.csv").open(encoding="utf-8") as metrics_file:
         for row in csv.DictReader(metrics_file):
             host = row["host"]
+            required_counters = (
+                "zk_cnt_readlatency",
+                "zk_sum_readlatency",
+                "zk_cnt_updatelatency",
+                "zk_sum_updatelatency",
+            )
+            if row["error"] or any(not row[name] for name in required_counters):
+                continue
             elapsed = float(row["elapsed_seconds"])
             znode_count = int(row["zk_znode_count"] or 0)
             sample = node_samples.setdefault(host, {"state": "", "max_connections": 0})
@@ -132,8 +142,16 @@ def generate_report(output_dir, manifest):
             if row["zk_server_state"] == "leader":
                 first_znode_count = znode_count if first_znode_count is None else first_znode_count
                 last_znode_count = znode_count
-                snapshot_time_ms = max(snapshot_time_ms, int(row["zk_snap_time_ms"] or 0))
-                snapshot_blocking_ms = max(snapshot_blocking_ms, int(row["zk_snap_blocking_time_ms"] or 0))
+                snapshot_values = (
+                    int(row["zk_snap_count"] or 0),
+                    int(row["zk_snap_time_ms"] or 0),
+                    int(row["zk_snap_blocking_time_ms"] or 0),
+                )
+                if snapshot_baseline is None:
+                    snapshot_baseline = snapshot_values
+                snapshot_count = max(snapshot_count, snapshot_values[0] - snapshot_baseline[0])
+                snapshot_time_ms = max(snapshot_time_ms, snapshot_values[1] - snapshot_baseline[1])
+                snapshot_blocking_ms = max(snapshot_blocking_ms, snapshot_values[2] - snapshot_baseline[2])
                 if row["zk_in_snapshot"] == "1":
                     snapshot_start = elapsed if snapshot_start is None else snapshot_start
                     snapshot_end = elapsed
@@ -141,7 +159,8 @@ def generate_report(output_dir, manifest):
             if host in previous:
                 old = previous[host]
                 delta_seconds = elapsed - float(old["elapsed_seconds"])
-                if delta_seconds > 0:
+                counters_reset = any(int(row[name]) < int(old[name]) for name in required_counters)
+                if delta_seconds > 0 and not counters_reset:
                     bucket = int(elapsed)
                     interval = intervals.setdefault(
                         bucket,
@@ -201,6 +220,7 @@ def generate_report(output_dir, manifest):
         "last_znode_count": last_znode_count,
         "snapshot_start_second": snapshot_start,
         "snapshot_end_second": snapshot_end,
+        "snapshot_count": snapshot_count,
         "snapshot_time_ms": snapshot_time_ms,
         "snapshot_blocking_ms": snapshot_blocking_ms,
         "peak_interval": peak,
@@ -255,6 +275,7 @@ def generate_report(output_dir, manifest):
             f"- P99 latency: {all_result.get('p99_us', 0) / 1000:,.3f} ms",
             f"- P99.9 latency: {all_result.get('p999_us', 0) / 1000:,.3f} ms",
             f"- Errors: {all_result.get('errors', 0):,}",
+            f"- Snapshots completed: {snapshot_count:,}",
             f"- Snapshot time: {snapshot_time_ms:,} ms",
             f"- Snapshot blocking time: {snapshot_blocking_ms:,} ms",
         ]
@@ -324,7 +345,9 @@ def main():
     if args.reuse_existing and not args.root_name:
         parser.error("--reuse-existing requires --root-name")
 
-    output_dir = Path(args.output_dir or f"benchmark-results/{root_name}").resolve()
+    output_dir = Path(args.output_dir or f"benchmark-results/{root_name}/{timestamp}").resolve()
+    if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
+        parser.error(f"output directory is not empty: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     common = [

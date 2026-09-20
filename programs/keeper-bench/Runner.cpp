@@ -155,9 +155,10 @@ Runner::Runner(
 
     pool.emplace(concurrency);
     hostname = Poco::Net::DNS::hostName();
+    run_token = fmt::format("{}_{}_{}", hostname, getpid(), generateRandomString(8));
 
     if (clickhouse_workload.root_name.empty())
-        root_path = fmt::format("{}/bench_{}_{}_{}", bench_path, hostname, getpid(), generateRandomString(8));
+        root_path = bench_path + "/bench_" + run_token;
     else
         root_path = bench_path + "/" + clickhouse_workload.root_name;
 
@@ -209,6 +210,23 @@ void createIfNotExists(ZooKeeperPtr zk, const std::string & path, const std::str
         return;
 
     throw zkutil::KeeperException(code, path);
+}
+
+void createOrSet(ZooKeeperPtr zk, const std::string & path, const std::string & data)
+{
+    std::string path_created;
+    auto error = createImpl(zk, path, data, zkutil::CreateMode::Persistent, path_created);
+    if (error == Coordination::Error::ZOK)
+        return;
+    if (error != Coordination::Error::ZNODEEXISTS)
+        throw zkutil::KeeperException(error, path);
+
+    auto promise = std::make_shared<std::promise<Coordination::Error>>();
+    auto future = promise->get_future();
+    zk->set(path, data, -1, [promise](const Coordination::SetResponse & response) { promise->set_value(response.error); });
+    error = future.get();
+    if (error != Coordination::Error::ZOK)
+        throw zkutil::KeeperException(error, path);
 }
 
 void createEphemeral(ZooKeeperPtr zk, const std::string & path, const std::string & data)
@@ -356,6 +374,43 @@ void Runner::setupClickHouseWorkload(ZooKeeperPtr zk)
     }
 }
 
+void Runner::validateClickHouseWorkload(ZooKeeperPtr zk)
+{
+    auto validate_group = [&](size_t group_index)
+    {
+        const String group_path = getMetadataGroupPath(root_path, group_index);
+        const Strings paths{
+            group_path + "/blocks",
+            group_path + "/replicas/r0/parts",
+            group_path + "/replicas/r1/parts",
+        };
+        for (const auto & path : paths)
+        {
+            Strings children;
+            getChildren(zk, path, children);
+            if (children.size() < clickhouse_workload.children_per_list)
+            {
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "ClickHouse workload path {} has {} children, expected at least {}",
+                    path,
+                    children.size(),
+                    clickhouse_workload.children_per_list);
+            }
+        }
+    };
+
+    validate_group(0);
+    if (clickhouse_workload.metadata_groups > 1)
+        validate_group(clickhouse_workload.metadata_groups - 1);
+}
+
+void Runner::shutdownWorkers()
+{
+    shutdown.store(true);
+    shutdown_cv.notify_all();
+}
+
 
 void Runner::work(ZooKeeperPtr zk, size_t thread_idx)
 {
@@ -365,7 +420,7 @@ void Runner::work(ZooKeeperPtr zk, size_t thread_idx)
     }
     catch (...)
     {
-        shutdown.store(true);
+        shutdownWorkers();
         start.store(true);
         std::cerr << getCurrentExceptionMessage(true, true /* check embedded stack trace */) << std::endl;
         throw;
@@ -430,7 +485,7 @@ void Runner::workImpl(ZooKeeperPtr zk, size_t thread_idx)
         }
         catch (...)
         {
-            shutdown.store(true);
+            shutdownWorkers();
             throw;
         }
         in_flight.push_back({std::move(request), std::move(future), measured});
@@ -464,7 +519,9 @@ void Runner::workImpl(ZooKeeperPtr zk, size_t thread_idx)
             auto now = std::chrono::steady_clock::now();
             if (now < next_request_time)
             {
-                std::this_thread::sleep_until(next_request_time);
+                std::unique_lock lock(shutdown_mutex);
+                if (shutdown_cv.wait_until(lock, next_request_time, [this] { return shutdown.load(); }))
+                    break;
                 now = std::chrono::steady_clock::now();
             }
 
@@ -505,8 +562,9 @@ void Runner::workImpl(ZooKeeperPtr zk, size_t thread_idx)
                         "{}/replicas/r{}/parts/{}",
                         group_path,
                         replica_distribution(generator),
-                        getPartName(clickhouse_workload.children_per_list + request_index));
+                        fmt::format("growth_{}_{:020}", run_token, request_index));
                     request->data = data_rand_fill_str;
+                    request->acls = getDefaultACLs();
                     submit_request(std::move(request));
                     continue;
                 }
@@ -605,6 +663,7 @@ void Runner::workImpl(ZooKeeperPtr zk, size_t thread_idx)
                     auto create_request = std::make_shared<Coordination::ZooKeeperCreateRequest>();
                     create_request->path = fmt::format("{}/{}_{}", loop_path, path_rand_fill_str, create_index);
                     create_request->data = data_rand_fill_str;
+                    create_request->acls = getDefaultACLs();
 
                     submit_request(std::move(create_request));
                 }
@@ -703,20 +762,29 @@ void Runner::runBenchmark()
     LOG_INFO(logger, bench_info);
 
     createIfNotExists(zk, bench_path, toString(bench_cnt));
-    createIfNotExists(zk, root_path, bench_info);
     const String ready_path = bench_path + "/ready";
     createIfNotExists(zk, ready_path, "");
-    if (clickhouse_workload.enabled && !clickhouse_workload.skip_setup)
+    if (clickhouse_workload.enabled)
     {
-        setupClickHouseWorkload(zk);
-        if (clickhouse_workload.setup_only)
+        if (clickhouse_workload.skip_setup)
         {
-            LOG_INFO(logger, "ClickHouse workload setup complete at {}", root_path);
-            return;
+            validateClickHouseWorkload(zk);
+            createOrSet(zk, root_path, bench_info);
+        }
+        else
+        {
+            createIfNotExists(zk, root_path, bench_info);
+            setupClickHouseWorkload(zk);
+            if (clickhouse_workload.setup_only)
+            {
+                LOG_INFO(logger, "ClickHouse workload setup complete at {}", root_path);
+                return;
+            }
         }
     }
     else
     {
+        createIfNotExists(zk, root_path, bench_info);
         for (size_t i = 0; i < concurrency; ++i)
             createIfNotExists(zk, fmt::format("{}/worker_{}", root_path, i), "bench");
     }
@@ -749,7 +817,7 @@ void Runner::runBenchmark()
     }
     catch (...)
     {
-        shutdown.store(true);
+        shutdownWorkers();
         start.store(true);
         pool->wait();
         throw;
@@ -785,7 +853,7 @@ void Runner::runBenchmark()
     }
     catch (...)
     {
-        shutdown.store(true);
+        shutdownWorkers();
         start.store(true);
         pool->wait();
         throw;
@@ -798,7 +866,7 @@ void Runner::runBenchmark()
     LOG_INFO(logger, "Run benchmark for {} seconds", duration_sec);
     while (!shutdown.load() && benchmark_watch.elapsedSeconds() < duration_sec)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    shutdown.store(true);
+    shutdownWorkers();
 
     pool->wait();
     benchmark_watch.stop();
@@ -850,9 +918,9 @@ void Runner::runBenchmark()
         write_report);
 
 
-    createIfNotExists(zk, fmt::format("{}/all", root_path), all_report);
-    createIfNotExists(zk, fmt::format("{}/read", root_path), read_report);
-    createIfNotExists(zk, fmt::format("{}/write", root_path), write_report);
+    createOrSet(zk, fmt::format("{}/all", root_path), all_report);
+    createOrSet(zk, fmt::format("{}/read", root_path), read_report);
+    createOrSet(zk, fmt::format("{}/write", root_path), write_report);
 }
 
 
