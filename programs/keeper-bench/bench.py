@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from monitor_keeper import read_metrics, run_benchmark
+from monitor_keeper import parse_server, read_metrics, run_benchmark
 
 
 PROFILES = {
@@ -54,26 +54,39 @@ def run_and_tee(command, output_path):
             text=True,
             bufsize=1,
         )
-        for line in process.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            output.write(line)
-            output.flush()
+        try:
+            for line in process.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                output.write(line)
+                output.flush()
+        except BaseException:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise
         return process.wait()
 
 
 def collect_state(servers):
     state = {}
     for endpoint in servers:
-        host, port = endpoint.rsplit(":", 1)
+        host, port = parse_server(endpoint)
         try:
-            state[endpoint] = read_metrics(host, int(port))
+            state[endpoint] = read_metrics(host, port)
         except Exception as exception:
             state[endpoint] = {"error": repr(exception)}
     return state
 
 
-def generate_report(output_dir, manifest):
+def new_interval():
+    return {"read_rate": 0.0, "write_rate": 0.0, "read_count": 0, "read_sum_ms": 0, "write_count": 0, "write_sum_ms": 0}
+
+
+def generate_report(output_dir, manifest, return_code):
     benchmark_text = (output_dir / "benchmark.log").read_text(encoding="utf-8")
     state_before_path = output_dir / "state-before.json"
     state_before = json.loads(state_before_path.read_text(encoding="utf-8")) if state_before_path.exists() else {}
@@ -119,7 +132,7 @@ def generate_report(output_dir, manifest):
     snapshot_count = 0
     snapshot_time_ms = 0
     snapshot_blocking_ms = 0
-    snapshot_baseline = None
+    snapshot_baselines = {}
     first_znode_count = None
     last_znode_count = None
     node_samples = {}
@@ -139,7 +152,7 @@ def generate_report(output_dir, manifest):
             sample = node_samples.setdefault(host, {"state": "", "max_connections": 0})
             sample["state"] = row["zk_server_state"] or sample["state"]
             sample["max_connections"] = max(sample["max_connections"], int(row["zk_num_alive_connections"] or 0))
-            if row["zk_server_state"] == "leader":
+            if row["zk_server_state"] in ("leader", "standalone"):
                 first_znode_count = znode_count if first_znode_count is None else first_znode_count
                 last_znode_count = znode_count
                 snapshot_values = (
@@ -147,11 +160,11 @@ def generate_report(output_dir, manifest):
                     int(row["zk_snap_time_ms"] or 0),
                     int(row["zk_snap_blocking_time_ms"] or 0),
                 )
-                if snapshot_baseline is None:
-                    snapshot_baseline = snapshot_values
-                snapshot_count = max(snapshot_count, snapshot_values[0] - snapshot_baseline[0])
-                snapshot_time_ms = max(snapshot_time_ms, snapshot_values[1] - snapshot_baseline[1])
-                snapshot_blocking_ms = max(snapshot_blocking_ms, snapshot_values[2] - snapshot_baseline[2])
+                # per-endpoint baselines: counters survive leader changes under --no-reset-stats
+                baseline = snapshot_baselines.setdefault(host, snapshot_values)
+                snapshot_count = max(snapshot_count, snapshot_values[0] - baseline[0])
+                snapshot_time_ms = max(snapshot_time_ms, snapshot_values[1] - baseline[1])
+                snapshot_blocking_ms = max(snapshot_blocking_ms, snapshot_values[2] - baseline[2])
                 if row["zk_in_snapshot"] == "1":
                     snapshot_start = elapsed if snapshot_start is None else snapshot_start
                     snapshot_end = elapsed
@@ -162,27 +175,29 @@ def generate_report(output_dir, manifest):
                 counters_reset = any(int(row[name]) < int(old[name]) for name in required_counters)
                 if delta_seconds > 0 and not counters_reset:
                     bucket = int(elapsed)
-                    interval = intervals.setdefault(
-                        bucket,
-                        {"seconds": 0.0, "read_count": 0, "read_sum_ms": 0, "write_count": 0, "write_sum_ms": 0},
-                    )
-                    interval["seconds"] += delta_seconds
-                    interval["read_count"] += int(row["zk_cnt_readlatency"] or 0) - int(old["zk_cnt_readlatency"] or 0)
-                    interval["read_sum_ms"] += int(row["zk_sum_readlatency"] or 0) - int(old["zk_sum_readlatency"] or 0)
-                    interval["write_count"] += int(row["zk_cnt_updatelatency"] or 0) - int(old["zk_cnt_updatelatency"] or 0)
-                    interval["write_sum_ms"] += int(row["zk_sum_updatelatency"] or 0) - int(old["zk_sum_updatelatency"] or 0)
+                    interval = intervals.setdefault(bucket, new_interval())
+                    # per-endpoint rates: buckets may contain samples from only some endpoints
+                    read_delta = int(row["zk_cnt_readlatency"] or 0) - int(old["zk_cnt_readlatency"] or 0)
+                    write_delta = int(row["zk_cnt_updatelatency"] or 0) - int(old["zk_cnt_updatelatency"] or 0)
+                    read_sum_delta = int(row["zk_sum_readlatency"] or 0) - int(old["zk_sum_readlatency"] or 0)
+                    write_sum_delta = int(row["zk_sum_updatelatency"] or 0) - int(old["zk_sum_updatelatency"] or 0)
+                    interval["read_rate"] += read_delta / delta_seconds
+                    interval["write_rate"] += write_delta / delta_seconds
+                    interval["read_count"] += read_delta
+                    interval["read_sum_ms"] += read_sum_delta
+                    interval["write_count"] += write_delta
+                    interval["write_sum_ms"] += write_sum_delta
             previous[host] = row
 
     interval_results = []
     for second, values in sorted(intervals.items()):
         if values["read_count"] == 0 and values["write_count"] == 0:
             continue
-        wall_seconds = values["seconds"] / max(1, len(previous))
         interval_results.append(
             {
                 "second": second,
-                "read_qps": values["read_count"] / wall_seconds,
-                "write_qps": values["write_count"] / wall_seconds,
+                "read_qps": values["read_rate"],
+                "write_qps": values["write_rate"],
                 "read_average_ms": values["read_sum_ms"] / max(1, values["read_count"]),
                 "write_average_ms": values["write_sum_ms"] / max(1, values["write_count"]),
             }
@@ -209,7 +224,9 @@ def generate_report(output_dir, manifest):
         "operation_timeout_ms": manifest["operation_timeout_ms"],
         "session_timeout_ms": manifest["session_timeout_ms"],
     }
+    status = "complete" if return_code == 0 else f"failed (rc={return_code})"
     report = {
+        "status": status,
         "root_path": manifest["root_path"],
         "profile": manifest["profile"],
         "parameters": parameters,
@@ -232,6 +249,7 @@ def generate_report(output_dir, manifest):
     markdown = [
         "# RaftKeeper benchmark report",
         "",
+        f"- Status: {status}",
         f"- Root: `{manifest['root_path']}`",
         f"- Profile: `{manifest['profile']}`",
         f"- Keeper version: `{', '.join(versions)}`",
@@ -435,7 +453,7 @@ def main():
     return_code = run_benchmark(monitor_args)
     (output_dir / "state-after.json").write_text(json.dumps(collect_state(args.servers), indent=2), encoding="utf-8")
     if (output_dir / "keeper-metrics.csv").exists():
-        generate_report(output_dir, manifest)
+        generate_report(output_dir, manifest, return_code)
     print(f"benchmark_complete rc={return_code} root={manifest['root_path']} output={output_dir}")
     return return_code
 

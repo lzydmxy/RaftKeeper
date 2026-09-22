@@ -43,6 +43,9 @@ METRICS = (
 )
 
 
+SNAPSHOT_COMPLETION_TIMEOUT = 300.0
+
+
 def send_four_letter(host, port, command, timeout=5):
     with socket.create_connection((host, port), timeout=timeout) as connection:
         connection.sendall(command.encode("ascii"))
@@ -80,13 +83,42 @@ def trigger_snapshot(host, port, result):
 
 def parse_server(value):
     host, port = value.rsplit(":", 1)
-    return host, int(port)
+    # IPv6 endpoints arrive bracketed ([::1]:2181); sockets need the bare literal
+    return host.strip("[]"), int(port)
+
+
+def sample_row(endpoint, host, port, started, metrics, error):
+    return {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        "elapsed_seconds": f"{time.monotonic() - started:.3f}",
+        "host": endpoint,
+        "error": error,
+        **{metric: metrics.get(metric, "") for metric in METRICS},
+    }
+
+
+def wait_for_snapshot_completion(writer, output, endpoint, host, port, before, started):
+    deadline = time.monotonic() + SNAPSHOT_COMPLETION_TIMEOUT
+    while True:
+        try:
+            metrics = read_metrics(host, port)
+            error = ""
+        except Exception as exception:
+            metrics = {}
+            error = repr(exception)
+        writer.writerow(sample_row(endpoint, host, port, started, metrics, error))
+        output.flush()
+        if not error and metrics.get("zk_snap_count", "").isdigit() and int(metrics["zk_snap_count"]) > before:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Snapshot did not complete within {SNAPSHOT_COMPLETION_TIMEOUT:.0f} seconds")
+        time.sleep(1.0)
 
 
 def monitor(args, stop_event=None):
-    servers = [parse_server(value) for value in args.servers]
+    servers = [(value, *parse_server(value)) for value in args.servers]
     if args.reset_stats:
-        for host, port in servers:
+        for _, host, port in servers:
             send_four_letter(host, port, "srst")
 
     fieldnames = ["timestamp", "elapsed_seconds", "host", "error", *METRICS]
@@ -106,35 +138,33 @@ def monitor(args, stop_event=None):
                 break
 
             samples = []
-            for host, port in servers:
+            for endpoint, host, port in servers:
                 metrics = {}
                 error = ""
                 try:
                     metrics = read_metrics(host, port)
                 except Exception as exception:
                     error = repr(exception)
-                sample_time = time.monotonic()
-                row = {
-                    "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
-                    "elapsed_seconds": f"{sample_time - started:.3f}",
-                    "host": f"{host}:{port}",
-                    "error": error,
-                }
-                for metric in METRICS:
-                    row[metric] = metrics.get(metric, "")
-                samples.append(row)
+                samples.append(sample_row(endpoint, host, port, started, metrics, error))
 
             writer.writerows(samples)
             output.flush()
 
             if args.snapshot_at is not None and snapshot_thread is None and elapsed >= args.snapshot_at:
                 if args.snapshot_server:
-                    snapshot_host, snapshot_port = parse_server(args.snapshot_server)
+                    snapshot_endpoint = args.snapshot_server
                 else:
-                    leader = next((row for row in samples if row.get("zk_server_state") == "leader"), None)
+                    leader = next(
+                        (row for row in samples if row.get("zk_server_state") in ("leader", "standalone")), None
+                    )
                     if leader is None:
                         raise RuntimeError("No leader found for snapshot")
-                    snapshot_host, snapshot_port = parse_server(leader["host"])
+                    snapshot_endpoint = leader["host"]
+                snapshot_host, snapshot_port = parse_server(snapshot_endpoint)
+                try:
+                    snapshot_snap_count = int(read_metrics(snapshot_host, snapshot_port).get("zk_snap_count", "0"))
+                except Exception:
+                    snapshot_snap_count = None
                 snapshot_thread = threading.Thread(
                     target=trigger_snapshot,
                     args=(snapshot_host, snapshot_port, snapshot_result),
@@ -149,14 +179,19 @@ def monitor(args, stop_event=None):
             elif stop_event.wait(wait_seconds):
                 break
 
-    if snapshot_thread:
-        snapshot_thread.join(timeout=130)
-        print(f"snapshot_result={snapshot_result}")
-        if snapshot_thread.is_alive():
-            raise TimeoutError("Snapshot request did not finish within 130 seconds")
-        if "error" in snapshot_result:
-            raise RuntimeError(snapshot_result["error"])
-    elif args.snapshot_at is not None:
+        # csnp only schedules the snapshot; keep sampling until it actually completes
+        if snapshot_thread:
+            snapshot_thread.join(timeout=130)
+            print(f"snapshot_result={snapshot_result}")
+            if snapshot_thread.is_alive():
+                raise TimeoutError("Snapshot request did not finish within 130 seconds")
+            if "error" in snapshot_result:
+                raise RuntimeError(snapshot_result["error"])
+            if snapshot_snap_count is not None:
+                wait_for_snapshot_completion(
+                    writer, output, snapshot_endpoint, snapshot_host, snapshot_port, snapshot_snap_count, started
+                )
+    if snapshot_thread is None and args.snapshot_at is not None:
         raise RuntimeError("Benchmark ended before the requested snapshot was triggered")
 
 
@@ -178,6 +213,7 @@ def run_benchmark(args):
             monitor_errors.append(exception)
 
     benchmark_output = open(args.benchmark_output, "w", encoding="utf-8") if args.benchmark_output else None
+    process = None
     try:
         process = subprocess.Popen(
             command,
@@ -196,13 +232,23 @@ def run_benchmark(args):
                 monitor_thread = threading.Thread(target=monitor_target, daemon=True)
                 monitor_thread.start()
         return_code = process.wait()
+    except BaseException:
+        # Never leave the benchmark issuing requests after the wrapper dies
+        if process is not None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        raise
     finally:
         if benchmark_output:
             benchmark_output.close()
 
     stop_event.set()
     if monitor_thread:
-        monitor_thread.join(timeout=args.duration + 130)
+        monitor_thread.join(timeout=args.duration + SNAPSHOT_COMPLETION_TIMEOUT + 130)
     else:
         print(f"Start marker not found: {args.start_marker!r}", file=sys.stderr)
         return return_code or 2
