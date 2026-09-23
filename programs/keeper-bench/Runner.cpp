@@ -6,6 +6,7 @@
 #include <deque>
 #include <future>
 #include <iostream>
+#include <optional>
 #include <thread>
 #include <unistd.h>
 
@@ -463,7 +464,10 @@ void Runner::workImpl(ZooKeeperPtr zk, size_t thread_idx)
             write_stat.add(result.elapsed_microseconds);
     };
 
-    auto submit_request = [&](Coordination::ZooKeeperRequestPtr request, bool measured = true)
+    auto submit_request = [&](
+        Coordination::ZooKeeperRequestPtr request,
+        bool measured = true,
+        std::optional<std::chrono::steady_clock::time_point> scheduled_at = std::nullopt)
     {
         if (in_flight.size() >= pipeline_depth)
         {
@@ -473,10 +477,12 @@ void Runner::workImpl(ZooKeeperPtr zk, size_t thread_idx)
 
         auto promise = std::make_shared<std::promise<RequestResult>>();
         auto future = promise->get_future();
-        auto watch = std::make_shared<Stopwatch>();
-        Coordination::ResponseCallback callback = [promise, watch](const Coordination::Response & response)
+        // Paced requests include schedule debt and the pipeline-capacity wait above.
+        const auto started_at = scheduled_at.value_or(std::chrono::steady_clock::now());
+        Coordination::ResponseCallback callback = [promise, started_at](const Coordination::Response & response)
         {
-            promise->set_value({response.error, watch->elapsedMicroseconds()});
+            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started_at);
+            promise->set_value({response.error, static_cast<UInt64>(elapsed.count())});
         };
 
         try
@@ -537,6 +543,7 @@ void Runner::workImpl(ZooKeeperPtr zk, size_t thread_idx)
                     next_request_time = now;
                 }
             }
+            const auto scheduled_at = next_request_time;
             next_request_time += request_interval;
 
             if (shutdown.load())
@@ -565,7 +572,7 @@ void Runner::workImpl(ZooKeeperPtr zk, size_t thread_idx)
                         fmt::format("growth_{}_{:020}", run_token, request_index));
                     request->data = data_rand_fill_str;
                     request->acls = getDefaultACLs();
-                    submit_request(std::move(request));
+                    submit_request(std::move(request), true, scheduled_at);
                     continue;
                 }
 
@@ -601,7 +608,7 @@ void Runner::workImpl(ZooKeeperPtr zk, size_t thread_idx)
                 remove_request->path = churn_path;
                 requests.emplace_back(std::move(remove_request));
 
-                submit_request(std::make_shared<Coordination::ZooKeeperMultiRequest>(requests, getDefaultACLs()));
+                submit_request(std::make_shared<Coordination::ZooKeeperMultiRequest>(requests, getDefaultACLs()), true, scheduled_at);
             }
             else
             {
@@ -614,7 +621,7 @@ void Runner::workImpl(ZooKeeperPtr zk, size_t thread_idx)
                         group_path,
                         replica_distribution(generator),
                         getPartName(child_distribution(generator)));
-                    submit_request(std::move(request));
+                    submit_request(std::move(request), true, scheduled_at);
                 }
                 else if (operation < 98)
                 {
@@ -624,7 +631,7 @@ void Runner::workImpl(ZooKeeperPtr zk, size_t thread_idx)
                         request->path = group_path + "/blocks";
                     else
                         request->path = fmt::format("{}/replicas/r{}/parts", group_path, list_index - 1);
-                    submit_request(std::move(request));
+                    submit_request(std::move(request), true, scheduled_at);
                 }
                 else
                 {
@@ -634,7 +641,7 @@ void Runner::workImpl(ZooKeeperPtr zk, size_t thread_idx)
                         group_path,
                         replica_distribution(generator),
                         getPartName(child_distribution(generator)));
-                    submit_request(std::move(request));
+                    submit_request(std::move(request), true, scheduled_at);
                 }
             }
         }

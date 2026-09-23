@@ -83,7 +83,12 @@ def collect_state(servers):
 
 
 def new_interval():
-    return {"read_rate": 0.0, "write_rate": 0.0, "read_count": 0, "read_sum_ms": 0, "write_count": 0, "write_sum_ms": 0}
+    return {"seconds": 0.0, "read_count": 0, "read_sum_ms": 0, "write_count": 0, "write_sum_ms": 0}
+
+
+def format_measurement(result, name, spec, scale=1, unit=""):
+    value = result.get(name)
+    return "N/A" if value is None else f"{format(value / scale if scale != 1 else value, spec)}{unit}"
 
 
 def generate_report(output_dir, manifest, return_code):
@@ -107,8 +112,10 @@ def generate_report(output_dir, manifest, return_code):
         for match in result_pattern.finditer(benchmark_text)
     }
     errors_match = re.search(r"Result for all.*?errors:([0-9]+)", benchmark_text)
-    if errors_match and "all" in benchmark_results:
-        benchmark_results["all"]["errors"] = int(errors_match.group(1))
+    if "all" in benchmark_results:
+        benchmark_results["all"]["errors"] = int(errors_match.group(1)) if errors_match else None
+    for kind in ("all", "reads", "writes"):
+        benchmark_results.setdefault(kind, None)
     offered_match = re.search(
         r"Offered requests qps:([0-9.]+).*?issued:([0-9]+).*?target_qps:([0-9]+).*?"
         r"drop_late_requests:(true|false).*?dropped_slots:([0-9]+).*?max_schedule_lag_us:([0-9]+)",
@@ -132,7 +139,7 @@ def generate_report(output_dir, manifest, return_code):
     snapshot_count = 0
     snapshot_time_ms = 0
     snapshot_blocking_ms = 0
-    snapshot_baselines = {}
+    previous_snapshots = {}
     first_znode_count = None
     last_znode_count = None
     node_samples = {}
@@ -145,7 +152,7 @@ def generate_report(output_dir, manifest, return_code):
                 "zk_cnt_updatelatency",
                 "zk_sum_updatelatency",
             )
-            if row["error"] or any(not row[name] for name in required_counters):
+            if row["error"]:
                 continue
             elapsed = float(row["elapsed_seconds"])
             znode_count = int(row["zk_znode_count"] or 0)
@@ -155,19 +162,24 @@ def generate_report(output_dir, manifest, return_code):
             if row["zk_server_state"] in ("leader", "standalone"):
                 first_znode_count = znode_count if first_znode_count is None else first_znode_count
                 last_znode_count = znode_count
-                snapshot_values = (
-                    int(row["zk_snap_count"] or 0),
-                    int(row["zk_snap_time_ms"] or 0),
-                    int(row["zk_snap_blocking_time_ms"] or 0),
-                )
-                # per-endpoint baselines: counters survive leader changes under --no-reset-stats
-                baseline = snapshot_baselines.setdefault(host, snapshot_values)
-                snapshot_count = max(snapshot_count, snapshot_values[0] - baseline[0])
-                snapshot_time_ms = max(snapshot_time_ms, snapshot_values[1] - baseline[1])
-                snapshot_blocking_ms = max(snapshot_blocking_ms, snapshot_values[2] - baseline[2])
-                if row["zk_in_snapshot"] == "1":
-                    snapshot_start = elapsed if snapshot_start is None else snapshot_start
-                    snapshot_end = elapsed
+
+            # Snapshot counters are node-local. Keep following every endpoint after
+            # role changes and sum increments, never historical counters across nodes.
+            snapshot_counters = ("zk_snap_count", "zk_snap_time_ms", "zk_snap_blocking_time_ms")
+            if all(row[name] for name in snapshot_counters):
+                snapshot_values = tuple(int(row[name]) for name in snapshot_counters)
+                old_snapshots = previous_snapshots.get(host, snapshot_values)
+                if all(value >= old for value, old in zip(snapshot_values, old_snapshots)):
+                    snapshot_count += snapshot_values[0] - old_snapshots[0]
+                    snapshot_time_ms += snapshot_values[1] - old_snapshots[1]
+                    snapshot_blocking_ms += snapshot_values[2] - old_snapshots[2]
+                previous_snapshots[host] = snapshot_values
+            if row["zk_in_snapshot"] == "1":
+                snapshot_start = elapsed if snapshot_start is None else snapshot_start
+                snapshot_end = elapsed
+
+            if any(not row[name] for name in required_counters):
+                continue
 
             if host in previous:
                 old = previous[host]
@@ -175,14 +187,13 @@ def generate_report(output_dir, manifest, return_code):
                 counters_reset = any(int(row[name]) < int(old[name]) for name in required_counters)
                 if delta_seconds > 0 and not counters_reset:
                     bucket = int(elapsed)
-                    interval = intervals.setdefault(bucket, new_interval())
-                    # per-endpoint rates: buckets may contain samples from only some endpoints
+                    interval = intervals.setdefault(bucket, {}).setdefault(host, new_interval())
+                    # Combine samples within each endpoint before summing endpoint rates.
                     read_delta = int(row["zk_cnt_readlatency"] or 0) - int(old["zk_cnt_readlatency"] or 0)
                     write_delta = int(row["zk_cnt_updatelatency"] or 0) - int(old["zk_cnt_updatelatency"] or 0)
                     read_sum_delta = int(row["zk_sum_readlatency"] or 0) - int(old["zk_sum_readlatency"] or 0)
                     write_sum_delta = int(row["zk_sum_updatelatency"] or 0) - int(old["zk_sum_updatelatency"] or 0)
-                    interval["read_rate"] += read_delta / delta_seconds
-                    interval["write_rate"] += write_delta / delta_seconds
+                    interval["seconds"] += delta_seconds
                     interval["read_count"] += read_delta
                     interval["read_sum_ms"] += read_sum_delta
                     interval["write_count"] += write_delta
@@ -190,14 +201,15 @@ def generate_report(output_dir, manifest, return_code):
             previous[host] = row
 
     interval_results = []
-    for second, values in sorted(intervals.items()):
+    for second, endpoints in sorted(intervals.items()):
+        values = {name: sum(endpoint[name] for endpoint in endpoints.values()) for name in new_interval()}
         if values["read_count"] == 0 and values["write_count"] == 0:
             continue
         interval_results.append(
             {
                 "second": second,
-                "read_qps": values["read_rate"],
-                "write_qps": values["write_rate"],
+                "read_qps": sum(endpoint["read_count"] / endpoint["seconds"] for endpoint in endpoints.values()),
+                "write_qps": sum(endpoint["write_count"] / endpoint["seconds"] for endpoint in endpoints.values()),
                 "read_average_ms": values["read_sum_ms"] / max(1, values["read_count"]),
                 "write_average_ms": values["write_sum_ms"] / max(1, values["write_count"]),
             }
@@ -224,7 +236,8 @@ def generate_report(output_dir, manifest, return_code):
         "operation_timeout_ms": manifest["operation_timeout_ms"],
         "session_timeout_ms": manifest["session_timeout_ms"],
     }
-    status = "complete" if return_code == 0 else f"failed (rc={return_code})"
+    statistics_complete = all(benchmark_results.values()) and errors_match is not None
+    status = ("complete" if statistics_complete else "incomplete") if return_code == 0 else f"failed (rc={return_code})"
     report = {
         "status": status,
         "root_path": manifest["root_path"],
@@ -244,7 +257,7 @@ def generate_report(output_dir, manifest, return_code):
     }
     (output_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-    all_result = benchmark_results.get("all", {})
+    all_result = benchmark_results["all"] or {}
     versions = sorted({node["version"] for node in nodes if node["version"]})
     markdown = [
         "# RaftKeeper benchmark report",
@@ -288,11 +301,12 @@ def generate_report(output_dir, manifest, return_code):
             "",
             "## Results",
             "",
-            f"- Completed QPS: {all_result.get('qps', 0):,.1f}",
-            f"- Average latency: {all_result.get('average_us', 0) / 1000:,.3f} ms",
-            f"- P99 latency: {all_result.get('p99_us', 0) / 1000:,.3f} ms",
-            f"- P99.9 latency: {all_result.get('p999_us', 0) / 1000:,.3f} ms",
-            f"- Errors: {all_result.get('errors', 0):,}",
+            f"- Completed QPS: {format_measurement(all_result, 'qps', ',.1f')}",
+            f"- Average latency: {format_measurement(all_result, 'average_us', ',.3f', 1000, ' ms')}",
+            f"- P99 latency: {format_measurement(all_result, 'p99_us', ',.3f', 1000, ' ms')}",
+            f"- P99.9 latency: {format_measurement(all_result, 'p999_us', ',.3f', 1000, ' ms')}",
+            f"- Errors: {format_measurement(all_result, 'errors', ',')}",
+            "- Snapshot totals: sum across monitored nodes",
             f"- Snapshots completed: {snapshot_count:,}",
             f"- Snapshot time: {snapshot_time_ms:,} ms",
             f"- Snapshot blocking time: {snapshot_blocking_ms:,} ms",

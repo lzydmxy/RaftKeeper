@@ -97,10 +97,17 @@ def sample_row(endpoint, host, port, started, metrics, error):
     }
 
 
-def wait_for_snapshot_completion(writer, output, endpoint, host, port, before, started):
+def wait_for_snapshot_completion(writer, output, endpoint, host, port, requested_index, started):
     deadline = time.monotonic() + SNAPSHOT_COMPLETION_TIMEOUT
     while True:
+        completed = False
         try:
+            # A counter increment may belong to an automatic snapshot. Verify the
+            # index returned by csnp on the same endpoint, even after demotion.
+            log_info = dict(
+                line.split("\t", 1) for line in send_four_letter(host, port, "lgif").splitlines() if "\t" in line
+            )
+            completed = int(log_info["last_snapshot_idx"]) >= requested_index
             metrics = read_metrics(host, port)
             error = ""
         except Exception as exception:
@@ -108,10 +115,13 @@ def wait_for_snapshot_completion(writer, output, endpoint, host, port, before, s
             error = repr(exception)
         writer.writerow(sample_row(endpoint, host, port, started, metrics, error))
         output.flush()
-        if not error and metrics.get("zk_snap_count", "").isdigit() and int(metrics["zk_snap_count"]) > before:
+        if completed and not error:
             return
         if time.monotonic() >= deadline:
-            raise TimeoutError(f"Snapshot did not complete within {SNAPSHOT_COMPLETION_TIMEOUT:.0f} seconds")
+            raise TimeoutError(
+                f"Snapshot index {requested_index} on {endpoint} did not complete within "
+                f"{SNAPSHOT_COMPLETION_TIMEOUT:.0f} seconds; last error: {error or 'none'}"
+            )
         time.sleep(1.0)
 
 
@@ -161,10 +171,6 @@ def monitor(args, stop_event=None):
                         raise RuntimeError("No leader found for snapshot")
                     snapshot_endpoint = leader["host"]
                 snapshot_host, snapshot_port = parse_server(snapshot_endpoint)
-                try:
-                    snapshot_snap_count = int(read_metrics(snapshot_host, snapshot_port).get("zk_snap_count", "0"))
-                except Exception:
-                    snapshot_snap_count = None
                 snapshot_thread = threading.Thread(
                     target=trigger_snapshot,
                     args=(snapshot_host, snapshot_port, snapshot_result),
@@ -187,10 +193,9 @@ def monitor(args, stop_event=None):
                 raise TimeoutError("Snapshot request did not finish within 130 seconds")
             if "error" in snapshot_result:
                 raise RuntimeError(snapshot_result["error"])
-            if snapshot_snap_count is not None:
-                wait_for_snapshot_completion(
-                    writer, output, snapshot_endpoint, snapshot_host, snapshot_port, snapshot_snap_count, started
-                )
+            wait_for_snapshot_completion(
+                writer, output, snapshot_endpoint, snapshot_host, snapshot_port, int(snapshot_result["response"]), started
+            )
     if snapshot_thread is None and args.snapshot_at is not None:
         raise RuntimeError("Benchmark ended before the requested snapshot was triggered")
 

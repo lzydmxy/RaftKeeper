@@ -29,6 +29,11 @@ contains:
 - `state-before.json` and `state-after.json`: endpoint state snapshots.
 - `report.json` and `report.md`: parsed benchmark and peak-interval summary.
 
+Missing final client statistics are `null` in JSON and `N/A` in Markdown, not
+zero errors or latency. Reports distinguish complete, incomplete, and failed
+runs. Interval throughput sums each endpoint's count/time rate, including when
+`--monitor-interval` is below one second or an endpoint misses a sample.
+
 When `--output-dir` is omitted, each run writes to
 `benchmark-results/<root-name>/<timestamp>`. A non-empty explicit output
 directory is rejected instead of being overwritten.
@@ -126,6 +131,11 @@ slots and maximum schedule lag. Set operation/session timeouts to the production
 client values; otherwise a deliberate backlog test can expire at the default
 operation timeout before its latency is measured.
 
+For this paced workload, latency starts at the request's scheduled arrival and
+ends at its response, including schedule debt and waiting for pipeline capacity.
+In drop-late mode, discarded slots are excluded and the schedule is reset before
+measuring the next request.
+
 Use `monitor_keeper.py` to record one-second `mntr` samples and optionally
 trigger a snapshot during the run:
 
@@ -141,7 +151,16 @@ python3 programs/keeper-bench/monitor_keeper.py \
 ```
 
 `--reset-stats` sends the `srst` four-letter command and must only be used on a
-dedicated benchmark cluster. `--snapshot-server` must identify the leader.
+dedicated benchmark cluster. `--snapshot-server` must identify the leader or a
+standalone node. After `csnp` schedules a snapshot, monitoring continues on that
+endpoint until `lgif` reports `last_snapshot_idx` at least as large as the returned
+index, even if the endpoint becomes a follower. Failure to verify completion
+within 300 seconds fails the run; both four-letter commands must be enabled.
+
+Snapshot counts, duration, and blocking time in reports sum observed node-local
+counter increments across all monitored endpoints, including followers. These
+are per-node snapshot totals, not deduplicated cluster-wide snapshots; historical
+counters are excluded and counter resets establish a new baseline.
 
 The monitor can also own the benchmark process. It waits for the benchmark's
 `Run benchmark for` marker, then resets statistics and starts sampling, so setup
@@ -159,5 +178,23 @@ python3 programs/keeper-bench/monitor_keeper.py \
     -- ./build/programs/raftkeeper keeper-bench <benchmark options>
 ```
 
-The wrapper streams benchmark output, stops monitoring when the benchmark exits,
-and returns the benchmark's exit status.
+The wrapper streams benchmark output and stops monitoring when the benchmark
+exits, after waiting for any requested snapshot to complete. It returns a nonzero
+status if either the benchmark or monitoring fails.
+
+## Regression tests
+
+Run the reporting and snapshot-monitor tests without a cluster:
+
+```bash
+python3 -m unittest discover -s programs/keeper-bench/tests -v
+```
+
+To also test retained-backlog latency and the complete snapshot/report lifecycle,
+provide a built binary. These tests start a disposable standalone Keeper on local
+ports with temporary data; the latency test briefly pauses only that process.
+
+```bash
+KEEPER_BENCH_BINARY=build/programs/raftkeeper \
+    python3 -m unittest discover -s programs/keeper-bench/tests -v
+```
