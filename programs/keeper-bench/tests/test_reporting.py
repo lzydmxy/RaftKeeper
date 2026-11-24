@@ -77,6 +77,15 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(report["peak_interval"]["read_qps"], 300)
         self.assertEqual(report["peak_interval"]["read_average_ms"], 2)
 
+    def test_partial_samples_reset_latency_baseline(self):
+        rows = [
+            sample(0, reads=10),
+            sample(1, reads=20, zk_sum_readlatency=""),
+            sample(2, reads=30),
+        ]
+        report, _ = self.report(rows)
+        self.assertIsNone(report["peak_interval"])
+
     def test_failed_run_has_unavailable_measurements(self):
         report, markdown = self.report([])
         self.assertEqual(report["status"], "failed (rc=1)")
@@ -142,7 +151,63 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(report["last_znode_count"], 120)
 
 
+class BenchmarkProcessTests(unittest.TestCase):
+    def run_benchmark(self, monitor):
+        with patch.object(monitor_keeper, "monitor", monitor):
+            return monitor_keeper.run_benchmark(SimpleNamespace(
+                benchmark_command=[
+                    sys.executable, "-u", "-c",
+                    "import time\nprint('Run benchmark for 60 seconds')\n"
+                "for _ in range(60):\n    print('progress')\n    time.sleep(1)",
+                ],
+                start_marker="Run benchmark for",
+                benchmark_output=None,
+                duration=60,
+            ))
+
+    def test_monitor_failure_stops_running_benchmark(self):
+        def fail_monitor(*args):
+            raise RuntimeError("metrics unavailable")
+
+        self.assertNotEqual(self.run_benchmark(fail_monitor), 0)
+
+    def test_monitor_failure_stops_benchmark_without_more_output(self):
+        process = None
+
+        def fail_monitor(*args):
+            raise RuntimeError("metrics unavailable")
+
+        args = SimpleNamespace(
+            benchmark_command=[sys.executable, "-u", "-c", "import time\nprint('Run benchmark for')\ntime.sleep(60)"],
+            start_marker="Run benchmark for", benchmark_output=None, duration=60,
+        )
+        with patch.object(monitor_keeper, "monitor", fail_monitor), patch.object(
+            monitor_keeper.subprocess, "Popen", wraps=monitor_keeper.subprocess.Popen
+        ) as popen:
+            return_code = monitor_keeper.run_benchmark(args)
+            process = popen.return_value
+        self.assertNotEqual(return_code, 0)
+        self.assertIsNotNone(process.poll())
+
+    def test_monitor_timeout_fails(self):
+        monitor_thread = unittest.mock.Mock()
+        monitor_thread.is_alive.return_value = True
+        args = SimpleNamespace(benchmark_command=["benchmark"], start_marker="Run benchmark for", benchmark_output=None, duration=60)
+        with patch.object(monitor_keeper.subprocess, "Popen") as popen, patch.object(
+            monitor_keeper.threading, "Thread", return_value=monitor_thread
+        ):
+            popen.return_value.stdout = io.StringIO("Run benchmark for 60 seconds\n")
+            popen.return_value.poll.return_value = 0
+            popen.return_value.wait.return_value = 0
+            self.assertEqual(monitor_keeper.run_benchmark(args), 2)
+
+
 class SnapshotMonitorTests(unittest.TestCase):
+    @patch.object(monitor_keeper, "send_four_letter", return_value="mntr is not whitelisted")
+    def test_invalid_metrics_response_is_an_error(self, command):
+        with self.assertRaises(RuntimeError):
+            monitor_keeper.read_metrics("a", 2181)
+
     def wait_for_completion(self):
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=["timestamp", "elapsed_seconds", "host", "error", *monitor_keeper.METRICS])
@@ -175,6 +240,30 @@ class SnapshotMonitorTests(unittest.TestCase):
     def test_unverifiable_completion_is_an_explicit_failure(self, metrics, command):
         with self.assertRaises(TimeoutError):
             self.wait_for_completion()
+
+    @patch.object(monitor_keeper, "wait_for_snapshot_completion")
+    @patch.object(monitor_keeper, "send_four_letter", return_value="200")
+    @patch.object(monitor_keeper, "read_metrics")
+    def test_snapshot_waits_for_a_successful_leader_sample(self, metrics, command, wait):
+        stop_event = threading.Event()
+        metrics.side_effect = [
+            OSError("temporarily unavailable"),
+            {"zk_server_state": "standalone"},
+        ]
+
+        def schedule_snapshot(*args, **kwargs):
+            stop_event.set()
+            return "200"
+
+        command.side_effect = schedule_snapshot
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(
+                servers=["a:2181"], reset_stats=False, duration=1, interval=0,
+                snapshot_at=0, snapshot_server=None, output=str(Path(directory) / "metrics.csv"),
+            )
+            monitor_keeper.monitor(args, stop_event)
+        wait.assert_called_once()
+        self.assertEqual(wait.call_args.args[5], 200)
 
     @patch.object(monitor_keeper, "wait_for_snapshot_completion")
     @patch.object(monitor_keeper, "send_four_letter", return_value="200")

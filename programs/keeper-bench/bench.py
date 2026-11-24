@@ -179,6 +179,7 @@ def generate_report(output_dir, manifest, return_code):
                 snapshot_end = elapsed
 
             if any(not row[name] for name in required_counters):
+                previous.pop(host, None)
                 continue
 
             if host in previous:

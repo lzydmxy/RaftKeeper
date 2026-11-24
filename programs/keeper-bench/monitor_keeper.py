@@ -60,11 +60,14 @@ def send_four_letter(host, port, command, timeout=5):
 
 
 def read_metrics(host, port):
+    response = send_four_letter(host, port, "mntr")
     values = {}
-    for line in send_four_letter(host, port, "mntr").splitlines():
+    for line in response.splitlines():
         fields = line.split("\t", 1)
         if len(fields) == 2:
             values[fields[0]] = fields[1]
+    if "zk_server_state" not in values:
+        raise RuntimeError(f"Invalid mntr response: {response.strip() or 'empty response'}")
     return values
 
 
@@ -135,6 +138,7 @@ def monitor(args, stop_event=None):
     started = time.monotonic()
     next_sample = started
     snapshot_thread = None
+    snapshot_endpoint = None
     snapshot_result = {}
 
     with open(args.output, "w", newline="", encoding="utf-8") as output:
@@ -167,16 +171,16 @@ def monitor(args, stop_event=None):
                     leader = next(
                         (row for row in samples if row.get("zk_server_state") in ("leader", "standalone")), None
                     )
-                    if leader is None:
-                        raise RuntimeError("No leader found for snapshot")
-                    snapshot_endpoint = leader["host"]
-                snapshot_host, snapshot_port = parse_server(snapshot_endpoint)
-                snapshot_thread = threading.Thread(
-                    target=trigger_snapshot,
-                    args=(snapshot_host, snapshot_port, snapshot_result),
-                    daemon=True,
-                )
-                snapshot_thread.start()
+                    if leader is not None:
+                        snapshot_endpoint = leader["host"]
+                if snapshot_endpoint is not None:
+                    snapshot_host, snapshot_port = parse_server(snapshot_endpoint)
+                    snapshot_thread = threading.Thread(
+                        target=trigger_snapshot,
+                        args=(snapshot_host, snapshot_port, snapshot_result),
+                        daemon=True,
+                    )
+                    snapshot_thread.start()
 
             next_sample += args.interval
             wait_seconds = max(0, next_sample - time.monotonic())
@@ -219,6 +223,7 @@ def run_benchmark(args):
 
     benchmark_output = open(args.benchmark_output, "w", encoding="utf-8") if args.benchmark_output else None
     process = None
+    monitor_timeout = args.duration + SNAPSHOT_COMPLETION_TIMEOUT + 130
     try:
         process = subprocess.Popen(
             command,
@@ -227,19 +232,28 @@ def run_benchmark(args):
             text=True,
             bufsize=1,
         )
-        for line in process.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            if benchmark_output:
-                benchmark_output.write(line)
-                benchmark_output.flush()
-            if monitor_thread is None and args.start_marker in line:
-                monitor_thread = threading.Thread(target=monitor_target, daemon=True)
-                monitor_thread.start()
-        return_code = process.wait()
+        with process.stdout:
+            for line in process.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                if benchmark_output:
+                    benchmark_output.write(line)
+                    benchmark_output.flush()
+                if monitor_thread is None and args.start_marker in line:
+                    monitor_thread = threading.Thread(target=monitor_target, daemon=True)
+                    monitor_thread.start()
+                if monitor_errors or (monitor_thread and not monitor_thread.is_alive()):
+                    if process.poll() is None:
+                        process.terminate()
+                    break
+        try:
+            return_code = process.wait(timeout=10 if monitor_errors else None)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return_code = process.wait()
     except BaseException:
         # Never leave the benchmark issuing requests after the wrapper dies
-        if process is not None:
+        if process is not None and process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=10)
@@ -248,14 +262,18 @@ def run_benchmark(args):
                 process.wait()
         raise
     finally:
+        stop_event.set()
         if benchmark_output:
             benchmark_output.close()
 
-    stop_event.set()
     if monitor_thread:
-        monitor_thread.join(timeout=args.duration + SNAPSHOT_COMPLETION_TIMEOUT + 130)
+        monitor_thread.join(timeout=monitor_timeout)
     else:
         print(f"Start marker not found: {args.start_marker!r}", file=sys.stderr)
+        return return_code or 2
+
+    if monitor_thread.is_alive():
+        print("Keeper monitor did not finish before its timeout", file=sys.stderr)
         return return_code or 2
 
     if monitor_errors:

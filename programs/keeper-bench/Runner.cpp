@@ -243,13 +243,33 @@ void createBatch(ZooKeeperPtr zk, const Coordination::Requests & requests)
     if (requests.empty())
         return;
 
-    auto promise = std::make_shared<std::promise<Coordination::Error>>();
+    auto promise = std::make_shared<std::promise<Coordination::MultiResponse>>();
     auto future = promise->get_future();
-    zk->multi(requests, [promise](const Coordination::MultiResponse & response) { promise->set_value(response.error); });
+    zk->multi(requests, [promise](const Coordination::MultiResponse & response) { promise->set_value(response); });
 
-    auto error = future.get();
-    if (error != Coordination::Error::ZOK)
-        throw zkutil::KeeperException(error);
+    const auto & response = future.get();
+    if (response.error == Coordination::Error::ZOK)
+        return;
+    if (response.responses.size() != requests.size())
+        throw zkutil::KeeperException(response.error);
+    bool has_existing_node = false;
+    for (size_t i = 0; i < response.responses.size(); ++i)
+    {
+        const auto error = response.responses[i]->error;
+        if (error == Coordination::Error::ZNODEEXISTS)
+            has_existing_node = true;
+        else if (error != Coordination::Error::ZOK && error != Coordination::Error::ZRUNTIMEINCONSISTENCY)
+            throw zkutil::KeeperException(error, requests[i]->getPath());
+    }
+    if (!has_existing_node)
+        throw zkutil::KeeperException(response.error);
+
+    /// An existing node rolls back the whole Multi. Create every missing node individually.
+    for (const auto & request : requests)
+    {
+        const auto & create_request = dynamic_cast<const Coordination::CreateRequest &>(*request);
+        createIfNotExists(zk, create_request.path, create_request.data);
+    }
 }
 
 const Coordination::ACLs & getDefaultACLs()
@@ -448,7 +468,9 @@ void Runner::workImpl(ZooKeeperPtr zk, size_t thread_idx)
     auto collect_request = [&](InFlightRequest & in_flight_request)
     {
         auto result = in_flight_request.future.get();
-        if (result.error != Coordination::Error::ZOK)
+        if (result.error != Coordination::Error::ZOK
+            && !(result.error == Coordination::Error::ZNONODE
+                 && in_flight_request.request->getOpNum() == Coordination::OpNum::Exists))
         {
             error_count.fetch_add(1);
             return;
@@ -873,10 +895,12 @@ void Runner::runBenchmark()
     LOG_INFO(logger, "Run benchmark for {} seconds", duration_sec);
     while (!shutdown.load() && benchmark_watch.elapsedSeconds() < duration_sec)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const auto offered_seconds = benchmark_watch.elapsedSeconds();
+    /// Draining in-flight requests and writing results must not dilute offered QPS.
+    benchmark_watch.stop();
     shutdownWorkers();
 
     pool->wait();
-    benchmark_watch.stop();
     const auto elapsed_seconds = benchmark_watch.elapsedSeconds();
 
     LOG_INFO(logger, "All work finished, please delete node {} manually", root_path);
@@ -909,7 +933,7 @@ void Runner::runBenchmark()
         LOG_INFO(
             logger,
             "Offered requests qps:{:.1f}\tissued:{}\ttarget_qps:{}\tdrop_late_requests:{}\tdropped_slots:{}\tmax_schedule_lag_us:{}",
-            static_cast<double>(issued_requests.load()) / elapsed_seconds,
+            static_cast<double>(issued_requests.load()) / offered_seconds,
             issued_requests.load(),
             clickhouse_workload.target_read_qps + clickhouse_workload.target_write_qps,
             clickhouse_workload.drop_late_requests,

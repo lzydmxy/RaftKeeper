@@ -76,6 +76,93 @@ class NativeBenchmarkTests(unittest.TestCase):
                 process.kill()
                 process.wait()
 
+    def benchmark(self, *arguments):
+        return subprocess.run(
+            [
+                self.binary, "keeper-bench", "--server", self.endpoint,
+                "--concurrency", "1", "--pipeline-depth", "1", "--duration-sec", "1",
+                "--metadata-groups", "1", "--children-per-list", "3",
+                "--target-read-qps", "2000", "--target-write-qps", "0",
+                *arguments,
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30,
+        )
+
+    def test_setup_resumes_after_partial_initialization(self):
+        result = self.benchmark(
+            "--clickhouse-rmt-workload", "true", "--workload-root-name", "resume", "--setup-only", "true",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+        from kazoo.client import KazooClient
+
+        client = KazooClient(hosts=self.endpoint)
+        client.start(timeout=10)
+        self.addCleanup(client.close)
+        self.addCleanup(client.stop)
+        client.delete("/bench/resume/rmt/table_shard_0000/replicas/r0/parts/part_000000000000000000000000000000000000")
+
+        result = self.benchmark(
+            "--clickhouse-rmt-workload", "true", "--workload-root-name", "resume", "--setup-only", "true",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+        result = self.benchmark(
+            "--clickhouse-rmt-workload", "true", "--workload-root-name", "resume", "--skip-setup", "true",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("errors:0", result.stdout)
+
+    def test_offered_qps_excludes_inflight_drain(self):
+        result = self.benchmark(
+            "--clickhouse-rmt-workload", "true", "--workload-root-name", "drain", "--skip-setup", "true",
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+        result = self.benchmark(
+            "--clickhouse-rmt-workload", "true", "--workload-root-name", "drain", "--setup-only", "true",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+        process = subprocess.Popen(
+            [
+                self.binary, "keeper-bench", "--server", self.endpoint,
+                "--clickhouse-rmt-workload", "true", "--workload-root-name", "drain", "--skip-setup", "true",
+                "--concurrency", "1", "--pipeline-depth", "128", "--duration-sec", "1",
+                "--metadata-groups", "1", "--children-per-list", "3",
+                "--target-read-qps", "2000", "--target-write-qps", "0", "--operation-timeout-ms", "20000",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        self.addCleanup(self.stop_process, process)
+        self.addCleanup(process.stdout.close)
+        output = b""
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            deadline = time.monotonic() + 30
+            while b"Run benchmark for" not in output:
+                if time.monotonic() >= deadline or process.poll() is not None:
+                    self.fail(f"Benchmark never started: {output.decode(errors='replace')}")
+                if selector.select(timeout=1):
+                    output += os.read(process.stdout.fileno(), 65536)
+        self.server.send_signal(signal.SIGSTOP)
+        try:
+            time.sleep(3)
+        finally:
+            self.server.send_signal(signal.SIGCONT)
+        remaining, _ = process.communicate(timeout=30)
+        text = (output + remaining).decode()
+        self.assertEqual(process.returncode, 0, text)
+        offered = re.search(r"Offered requests qps:([0-9.]+)", text)
+        issued = re.search(r"Offered requests.*?issued:(\d+)", text)
+        elapsed = re.search(r"elapsed_sec: ([0-9.]+)", text)
+        self.assertIsNotNone(offered, text)
+        self.assertIsNotNone(issued, text)
+        self.assertIsNotNone(elapsed, text)
+        self.assertAlmostEqual(float(elapsed.group(1)), 1, delta=0.1, msg=text)
+        self.assertAlmostEqual(int(issued.group(1)) / float(elapsed.group(1)), float(offered.group(1)), delta=0.1)
+        self.assertLess(float(offered.group(1)), 1000, text)
+
     def test_retained_requests_include_server_stall_and_pipeline_wait(self):
         command = [
             self.binary, "keeper-bench", "--server", self.endpoint,

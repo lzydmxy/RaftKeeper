@@ -122,6 +122,11 @@ part-like nodes in ten minutes. `target-create-qps` must not exceed
 
 To repeat a test against the same initialized tree, provide the same
 `--bench-path` and `--workload-root-name` together with `--skip-setup true`.
+Interrupted setup can be resumed by running `--setup-only true` again; prefill
+batches accept already-existing nodes. An `exists` response reporting a missing
+node is a valid measured response, not a benchmark error. Offered QPS excludes
+the drain time after workers stop issuing requests; completed throughput and
+latency statistics include the drained responses.
 
 By default, workers discard offered-load slots that are already overdue. Set
 `--drop-late-requests false` to model ClickHouse-style backlog: after a Keeper
